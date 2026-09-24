@@ -1,0 +1,17 @@
+# .NET
+bin/
+obj/
+publicacao/
+*.user
+
+# IDE
+.vs/
+.idea/
+*.suo
+*.user
+
+# Logs locais
+*.log
+
+# Capturas temporarias do ambiente
+shot_current.png

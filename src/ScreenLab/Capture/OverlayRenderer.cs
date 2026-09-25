@@ -43,13 +43,6 @@ public static class OverlayRenderer
         // ("Usuário: João" → "Usuario: Joao") pra foto sair legível e sem "?".
         userText = RemoveAccents(userText);
 
-        // O disparo MANUAL (espaço/F9) não aparece no carimbo — não acrescenta
-        // informação e só polui. Movimento/câmera continuam marcados: aí o operador
-        // precisa saber por que a foto saiu.
-        if (!string.IsNullOrEmpty(trigger) &&
-            !string.Equals(trigger, "Manual", StringComparison.OrdinalIgnoreCase))
-            userText += $"   [{RemoveAccents(trigger)}]";
-
         Cv2.PutText(image, $"Usuario: {userText}", new Point(18, 78),
             HersheyFonts.HersheySimplex, fontSize, yellow, 2, LineTypes.AntiAlias);
     }

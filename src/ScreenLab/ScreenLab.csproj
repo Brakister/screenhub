@@ -22,6 +22,10 @@
   <ItemGroup>
     <Content Include="Data\*.xml" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\*.xml" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Modelos YuNet (detecção) e SFace (reconhecimento). Os ONNX precisam
+         chegar junto do exe publicado (self-contained). -->
+    <Content Include="Data\models\*.onnx" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\models\*.onnx" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

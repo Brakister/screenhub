@@ -109,6 +109,7 @@ public class MainForm : Form
     private CheckBox _ckStartup = null!;
 
     // Auto-enrollment
+    private CheckBox _ckAutoSwitchOperator = null!;
     private NumericUpDown _numMinCosine = null!;
     private NumericUpDown _numAutoEnrollCosine = null!;
     private NumericUpDown _numAutoEnrollConsecutive = null!;
@@ -432,6 +433,10 @@ public class MainForm : Form
 
     private void SelectOperator(string name)
     {
+        // O F10 aprende para este nome. Precisa ser registrado ANTES de
+        // qualquer troca automática sobrescrever o dropdown.
+        _engine.NotifyOperatorChosenByUser(name);
+
         if (_users.ActiveUser != name)
             _users.ActiveUser = name; // persiste o operador selecionado
         else
@@ -697,6 +702,7 @@ public class MainForm : Form
         _cboUser.SelectedIndexChanged += (s, e) =>
         {
             if (_loadingUi || _cboUser.SelectedItem is not string user) return;
+            _engine.NotifyOperatorChosenByUser(user);
             _users.ActiveUser = user;
             UpdateEnrollmentUi();
         };
@@ -763,6 +769,38 @@ public class MainForm : Form
         gb.Controls.Add(_lblEnrollFace);
         gb.Controls.Add(_btnEnrollFace);
         y += 84 + 28 + 14;
+
+        _ckAutoSwitchOperator = new CheckBox
+        {
+            Text = "Trocar o operador automaticamente pelo rosto",
+            AutoSize = true,
+            ForeColor = Color.White,
+            Checked = true,
+            Location = new Point(12, y),
+        };
+        _ckAutoSwitchOperator.CheckedChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _engine.AutoSwitchOperator = _ckAutoSwitchOperator.Checked;
+            ApplyStatus(_ckAutoSwitchOperator.Checked
+                ? "Troca automatica ligada: o app escolhe quem esta na camera"
+                : "Troca automatica desligada: as fotos usam o operador que voce escolheu");
+        };
+        gb.Controls.Add(_ckAutoSwitchOperator);
+        y += 26;
+
+        var hintSwitch = new Label
+        {
+            Text =
+                "Desligue quando duas pessoas se confundem entre si. O app ainda\n" +
+                "mostra quem ele acha que ve, mas nao mexe mais no operador: as\n" +
+                "fotos e o F10 seguem sempre quem voce escolheu aqui em cima.",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Location = new Point(12, y),
+        };
+        gb.Controls.Add(hintSwitch);
+        y += hintSwitch.Height + 14;
 
         AddLabel(gb, "Limiar de reconhecimento (cosseno):", 12, y);
         y += 20;

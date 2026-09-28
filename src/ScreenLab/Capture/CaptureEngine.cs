@@ -82,6 +82,19 @@ public sealed class CaptureEngine : IDisposable
     private string _confirmedUser = "";
     private DateTime _lastSeenAt = DateTime.MinValue;
     private DateTime _lastSampleAt = DateTime.MinValue;
+
+    // Último operador escolhido A MÃO pelo usuário (botões ou combo). O
+    // reconhecimento facial também escreve em UserManager.ActiveUser — é assim
+    // que as fotos são nomeadas sozinhas — mas essas duas coisas não podem ser a
+    // mesma: quando o app erra o nome, o F10 acabava gravando o rosto na
+    // galeria errada. O log mostra 3 poses do Victor entrando na galeria do
+    // Ailton exatamente assim.
+    private volatile string _operatorChosenByUser = "";
+
+    // Quando false, o reconhecimento facial não mexe no operador selecionado: o
+    // app passa a só mostrar quem acha que é, mas quem manda no nome das fotos
+    // é o usuário. É a saída quando duas pessoas se confundem entre si.
+    private volatile bool _autoSwitchOperator = true;
     private static readonly TimeSpan SampleInterval = TimeSpan.FromSeconds(30);
 
     // --- Ritmo de captura por rosto -------------------------------------------
@@ -162,6 +175,27 @@ public sealed class CaptureEngine : IDisposable
 
     public bool IsRunning => _running;
     public bool IsPaused => _paused;
+
+    /// <summary>
+    /// Chamado pela UI quando o usuário troca o operador no combo ou nos botões.
+    /// A partir daqui o F10 sabe para quem o rosto deve ser aprendido, sem
+    /// depender do que o reconhecimento facial acha.
+    /// </summary>
+    public void NotifyOperatorChosenByUser(string name)
+    {
+        if (!string.IsNullOrWhiteSpace(name))
+            _operatorChosenByUser = name;
+    }
+
+    /// <summary>Se o rosto detectado pode trocar o operador selecionado.</summary>
+    public bool AutoSwitchOperator
+    {
+        get => _autoSwitchOperator;
+        set => _autoSwitchOperator = value;
+    }
+
+    /// <summary>Quem o rosto está sendo identificado como agora ("" se ninguém).</summary>
+    public string DetectedUser => _confirmedUser;
 
     private void ReloadFaceGallery()
     {
@@ -373,24 +407,44 @@ public sealed class CaptureEngine : IDisposable
                 return;
             }
 
-            string activeUser = _users.ActiveUser;
+            // O destino é o operador que o USUÁRIO escolheu, nunca o que o
+            // reconhecimento facial deduziu. Se o app acha que quem está na
+            // câmera é outra pessoa, usar a dedução dele aqui gravava o teu
+            // rosto na galeria errada e reforçava a confusão — que foi
+            // exatamente o que aconteceu com o Ailton.
+            string target = _operatorChosenByUser.Length > 0
+                ? _operatorChosenByUser
+                : _users.ActiveUser;
+
+            bool conflict = _confirmedUser.Length > 0
+                && !string.Equals(_confirmedUser, target, StringComparison.OrdinalIgnoreCase);
+            if (conflict)
+            {
+                LoggerService.Warn(
+                    $"[LearnFace] Rosto na frente da câmera foi identificado como '{_confirmedUser}', "
+                    + $"mas o operador escolhido é '{target}'. A pose vai para '{target}' mesmo assim. "
+                    + "Se quem está na câmera não for essa pessoa, não use o F10.");
+            }
 
             // Mesmo caminho da fila: memória e disco mudam juntos, e o
             // CommitTemplate recusa duplicata e usuário cheio sem gravar nada.
-            if (!_faceRecognizer.CommitTemplate(activeUser, embedding))
+            if (!_faceRecognizer.CommitTemplate(target, embedding))
             {
                 LearnFaceCompleted?.Invoke(false, "Essa pose já está na galeria (ou o usuário está no limite)");
                 return;
             }
 
-            if (_users.AddFaceTemplate(activeUser, embedding))
+            if (_users.AddFaceTemplate(target, embedding))
             {
-                LoggerService.Info($"[LearnFace] Rosto aprendido para '{activeUser}' (total poses: {_users.FaceTemplateCount(activeUser)})");
-                LearnFaceCompleted?.Invoke(true, $"Rosto aprendido para '{activeUser}' ({_users.FaceTemplateCount(activeUser)} poses)");
+                int total = _users.FaceTemplateCount(target);
+                LoggerService.Info($"[LearnFace] Rosto aprendido para '{target}' (total poses: {total})");
+                string msg = $"Rosto aprendido para '{target}' ({total} poses)";
+                if (conflict) msg += $" — o app está achando que é '{_confirmedUser}'";
+                LearnFaceCompleted?.Invoke(true, msg);
             }
             else
             {
-                _faceRecognizer.RollbackTemplate(activeUser, embedding);
+                _faceRecognizer.RollbackTemplate(target, embedding);
                 LearnFaceCompleted?.Invoke(false, "Falha ao salvar no disco");
             }
         }
@@ -1514,11 +1568,16 @@ public sealed class CaptureEngine : IDisposable
         string previous = _confirmedUser;
         _confirmedUser = user;
         _lastSeenAt = now;
-        if (_users.ActiveUser != user)
+
+        if (_autoSwitchOperator && _users.ActiveUser != user)
             _users.ActiveUser = user;
+        else if (_operatorChosenByUser.Length == 0)
+            _operatorChosenByUser = user;
 
         if (!string.Equals(previous, user, StringComparison.OrdinalIgnoreCase))
-            LoggerService.Info($"Identidade facial confirmada: {user} (anterior: {previous ?? "-"})");
+            LoggerService.Info(
+                $"Identidade facial confirmada: {user} (anterior: {previous ?? "-"})"
+                + (_autoSwitchOperator ? "" : " — troca automática desligada, fotos seguem o operador escolhido"));
     }
 
     /// <summary>

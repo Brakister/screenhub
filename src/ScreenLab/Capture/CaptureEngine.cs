@@ -28,8 +28,8 @@ public sealed class CaptureEngine : IDisposable
     private const int PreviewHeight = 450;
     private const int FacePreviewWidth = 640;
     private const int FacePreviewHeight = 480;
-    private const int PreviewMinIntervalMs = 45; // ~22 fps
-    private const int LoopPauseMsWithPreview = 10;
+    private const int PreviewMinIntervalMs = 33; // ~30 fps preview
+    private const int LoopTargetMsWithPreview = 30; // ~33 fps target loop
     private const int LoopPauseMsWithoutPreview = 90; // oculto: ~10 leituras/s p/ economizar CPU
 
     private readonly AppConfig _config;
@@ -117,6 +117,7 @@ public sealed class CaptureEngine : IDisposable
     private DateTime _lastFaceCameraFailLog = DateTime.MinValue;
     private DateTime _nextFaceCameraRetryAt = DateTime.MinValue;
     private int _cameraFailStreak;
+    private int _faceCameraFailStreak;
     private Rect[] _lastFaceBoxes = Array.Empty<Rect>();
     private Point2f[][] _lastFaceLandmarks = Array.Empty<Point2f[]>();
     private string[] _lastFaceLabels = Array.Empty<string>();
@@ -728,6 +729,9 @@ public sealed class CaptureEngine : IDisposable
                 }
 
                 var frame = FrameBuffer;
+                var loopStart = Stopwatch.StartNew();
+
+                // --- LEITURA DA CÂMERA PRINCIPAL (sempre) ---
                 var swRead = Stopwatch.StartNew();
                 bool readOk = capture.Read(frame) && !frame.Empty();
 
@@ -740,9 +744,12 @@ public sealed class CaptureEngine : IDisposable
                     continue;
                 }
 
+                // --- LEITURA DA CÂMERA DO ROSTO (apenas quando necessário) ---
                 bool faceReadOk = false;
                 Mat? faceFrame = null;
-                if (EnsureFaceCameraOpen())
+                bool needFaceFrame = _pendingLearnFace || _pendingManualTrigger != "" || _config.FaceEnabled || _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs;
+
+                if (needFaceFrame && EnsureFaceCameraOpen())
                 {
                     if (_config.FaceCameraIndex == _config.CameraIndex)
                     {
@@ -822,9 +829,10 @@ public sealed class CaptureEngine : IDisposable
                     trigger = "Intervalo";
                     fire = true;
                 }
-                // Sem câmera de rosto: só processa reconhecimento no frame principal
-                else if (!faceReadOk)
+                // Sem câmera de rosto: só processa reconhecimento no frame principal (throttled)
+                else if (!faceReadOk && _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs)
                 {
+                    _faceWatch.Restart();
                     faceBoxes = Array.Empty<Rect>();
                     faceLandmarks = Array.Empty<Point2f[]>();
                     ProcessFaceRecognition(frame, faceBoxes, faceLandmarks);
@@ -877,6 +885,14 @@ public sealed class CaptureEngine : IDisposable
                         FacePreviewFrame?.Invoke(FacePreviewBuffer);
                     }
                 }
+
+                // --- Pacing adaptativo: só dorme o que faltar para ~30fps ---
+                loopStart.Stop();
+                int elapsedMs = (int)loopStart.ElapsedMilliseconds;
+                int targetMs = _previewWanted ? LoopTargetMsWithPreview : LoopPauseMsWithoutPreview;
+                int sleepMs = targetMs - elapsedMs;
+                if (sleepMs > 0)
+                    Thread.Sleep(sleepMs);
             }
             catch (Exception ex)
             {
@@ -884,8 +900,6 @@ public sealed class CaptureEngine : IDisposable
                 ErrorOccurred?.Invoke(ex.Message);
                 Thread.Sleep(1000);
             }
-
-            Thread.Sleep(_previewWanted ? LoopPauseMsWithPreview : LoopPauseMsWithoutPreview);
         }
     }
 
@@ -910,6 +924,7 @@ public sealed class CaptureEngine : IDisposable
             }
 
             cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+            cap.Set(VideoCaptureProperties.Fps, 30);
             if (_config.VideoWidth > 0)
                 cap.Set(VideoCaptureProperties.FrameWidth, _config.VideoWidth);
             if (_config.VideoHeight > 0)
@@ -948,18 +963,20 @@ public sealed class CaptureEngine : IDisposable
             if (!cap.IsOpened())
             {
                 cap.Dispose();
-                _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(2);
+                ScheduleFaceRetry();
                 LogFaceCameraUnavailable();
                 return false;
             }
 
             cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+            cap.Set(VideoCaptureProperties.Fps, 30);
             if (_config.FaceVideoWidth > 0)
                 cap.Set(VideoCaptureProperties.FrameWidth, _config.FaceVideoWidth);
             if (_config.FaceVideoHeight > 0)
                 cap.Set(VideoCaptureProperties.FrameHeight, _config.FaceVideoHeight);
 
             _faceCapture = cap;
+            _faceCameraFailStreak = 0;
             _nextFaceCameraRetryAt = DateTime.MinValue;
             LoggerService.Info(
                 $"Câmera do rosto {_config.FaceCameraIndex} aberta em {cap.FrameWidth}x{cap.FrameHeight}");
@@ -969,11 +986,20 @@ public sealed class CaptureEngine : IDisposable
         }
         catch (Exception ex)
         {
-            _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(2);
+            ScheduleFaceRetry();
             LoggerService.Error($"Falha ao abrir câmera do rosto {_config.FaceCameraIndex}", ex);
             LogFaceCameraUnavailable();
             return false;
         }
+    }
+
+    /// <summary>Backoff progressivo: tenta logo no início, depois espaça para
+    /// não ficar "se perguntando" pela câmera que não está ligada.</summary>
+    private void ScheduleFaceRetry()
+    {
+        int delay = _faceCameraFailStreak < 3 ? 2 : _faceCameraFailStreak < 8 ? 10 : 60;
+        _faceCameraFailStreak++;
+        _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(delay);
     }
 
     private void LogFaceCameraUnavailable()
@@ -982,7 +1008,7 @@ public sealed class CaptureEngine : IDisposable
             return;
         _lastFaceCameraFailLog = DateTime.Now;
         LoggerService.Warn(
-            $"Câmera do rosto {_config.FaceCameraIndex} indisponível — tentando novamente a cada 2 s");
+            $"Câmera do rosto {_config.FaceCameraIndex} indisponível — tentando novamente");
         StatusChanged?.Invoke(
             $"Câmera do rosto {_config.FaceCameraIndex} indisponível; foto da peça continua normalmente");
     }

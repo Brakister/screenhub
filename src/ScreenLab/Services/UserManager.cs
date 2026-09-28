@@ -10,7 +10,10 @@ namespace ScreenLab.Services;
 /// </summary>
 public class UserManager
 {
-    private const int MaxFaceTemplatesPerUser = 20;
+    // Espelha FaceRecognizerService.MaxPosesPerUser. Precisa ser igual, senão a
+    // galeria em memória e o disco divergem de contagem. 100 poses por pessoa
+    // cobrem bem ângulos diferentes; o custo é ~2,4 KB de JSON por pose.
+    public const int MaxFaceTemplatesPerUser = 100;
     private readonly AppConfig _config;
     private readonly string _configPath;
     private readonly object _sync = new();

@@ -109,10 +109,13 @@ public class MainForm : Form
     private CheckBox _ckStartup = null!;
 
     // Auto-enrollment
+    private NumericUpDown _numMinCosine = null!;
     private NumericUpDown _numAutoEnrollCosine = null!;
     private NumericUpDown _numAutoEnrollConsecutive = null!;
     private NumericUpDown _numAutoEnrollCooldown = null!;
     private NumericUpDown _numAutoEnrollBackoff = null!;
+    private NumericUpDown _numAutoEnrollNovelty = null!;
+    private Label _lblGalleryDiag = null!;
     private CheckBox _ckAutoEnrollEnabled = null!;
 
     public MainForm(bool startMinimized) : this(startMinimized, ConfigService.ConfigPath)
@@ -759,7 +762,43 @@ public class MainForm : Form
         gb.Controls.Add(_btnRemoveUser);
         gb.Controls.Add(_lblEnrollFace);
         gb.Controls.Add(_btnEnrollFace);
-        gb.Height = y + 84 + 28 + 14;
+        y += 84 + 28 + 14;
+
+        AddLabel(gb, "Limiar de reconhecimento (cosseno):", 12, y);
+        y += 20;
+        _numMinCosine = new NumericUpDown
+        {
+            Minimum = 0.20M,
+            Maximum = 0.90M,
+            DecimalPlaces = 3,
+            Increment = 0.005M,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 0.42M,
+        };
+        _numMinCosine.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _engine.SetMinimumCosine((float)_numMinCosine.Value);
+            RefreshGalleryDiagnostics();
+        };
+        gb.Controls.Add(_numMinCosine);
+        y += 28;
+
+        var hintCosine = new Label
+        {
+            Text =
+                "Acima do cosseno entre pessoas diferentes, abaixo do pior match\n" +
+                "legitimo. Com valor baixo demais, uma pessoa passa a ser\n" +
+                "identificada como a outra. Medir a separacao no grupo abaixo.",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Location = new Point(12, y),
+        };
+        gb.Controls.Add(hintCosine);
+        y += hintCosine.Height + 14;
+
+        gb.Height = y;
         return gb;
     }
 
@@ -857,6 +896,26 @@ public class MainForm : Form
         gb.Controls.Add(_numAutoEnrollBackoff);
         y += 30;
 
+        AddLabel(gb, "So aprender angulo realmente novo (cosseno):", 12, y);
+        y += 20;
+        _numAutoEnrollNovelty = new NumericUpDown
+        {
+            Minimum = 0.50M,
+            Maximum = 0.999M,
+            DecimalPlaces = 3,
+            Increment = 0.005M,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 0.90M,
+        };
+        _numAutoEnrollNovelty.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            ApplyAutoEnrollmentConfig();
+        };
+        gb.Controls.Add(_numAutoEnrollNovelty);
+        y += 30;
+
         var btnTestLearn = new Button
         {
             Text = "Testar: aprender rosto atual (F10)",
@@ -869,15 +928,38 @@ public class MainForm : Form
         gb.Controls.Add(btnTestLearn);
         y += 34;
 
+        _lblGalleryDiag = new Label
+        {
+            Text = "Medindo separacao das galerias...",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Location = new Point(12, y),
+        };
+        gb.Controls.Add(_lblGalleryDiag);
+        y += _lblGalleryDiag.Height + 6;
+
+        var btnDiag = new Button
+        {
+            Text = "Medir separacao entre as pessoas",
+            Width = 312,
+            Height = 26,
+            FlatStyle = FlatStyle.System,
+            Location = new Point(12, y),
+        };
+        btnDiag.Click += (s, e) => RefreshGalleryDiagnostics();
+        gb.Controls.Add(btnDiag);
+        y += 32;
+
         var hint = new Label
         {
             Text = "Como funciona:\n" +
-                   "• O sistema conta reconhecimentos consecutivos com confiança >= minima.\n" +
+                   "• O sistema conta reconhecimentos consecutivos com confianca >= minima.\n" +
                    "• Ao atingir N, a pose entra na galeria e e salva em disco.\n" +
-                   "• Rosto ja aprendido: nao insere nada e espera o back-off, sem\n" +
-                   "  reescrever o arquivo.\n" +
-                   "• Limite de 20 poses por usuario — ao encher, para de gravar ate\n" +
-                   "  voce refazer o cadastro. Por isso o volume de escrita e minimo.\n" +
+                   "• Pose parecida demais com alguma que ja existe: nao insere nada e\n" +
+                   "  espera o back-off, sem reescrever o arquivo.\n" +
+                   "• Limite de 100 poses por usuario — enche so com angulos diferentes,\n" +
+                   "  porque o cosseno de novidade e 0,90. Encheu, para ate refazer o\n" +
+                   "  cadastro. E por isso que o volume de escrita e minimo.\n" +
                    "• F10 aprende o rosto atual na hora, sem esperar as contagens.",
             AutoSize = true,
             ForeColor = Color.DimGray,
@@ -890,14 +972,46 @@ public class MainForm : Form
         return gb;
     }
 
+    /// <summary>
+    /// Mede a separação real entre as galerias. É o que denuncia a confusão
+    /// "eu virei a outra pessoa": quando o limiar de reconhecimento fica abaixo
+    /// do maior cosseno entre pessoas diferentes, uma sempre vence a outra.
+    /// </summary>
+    private void RefreshGalleryDiagnostics()
+    {
+        if (_engine == null || _lblGalleryDiag == null) return;
+        try
+        {
+            var d = _engine.DiagnoseFaceGallery();
+            if (d == null)
+            {
+                _lblGalleryDiag.ForeColor = Color.DimGray;
+                _lblGalleryDiag.Text = "Galeria vazia ou com menos de 2 poses: sem o que medir.";
+                return;
+            }
+
+            _lblGalleryDiag.ForeColor = d.ThresholdIsSafe ? Color.DarkGreen : Color.DarkRed;
+            _lblGalleryDiag.Text =
+                $"{d.PoseCount} poses | pior match da MESMA pessoa: {d.WorstIntraCosine:F3}\n" +
+                $"pior match entre PESSOAS DIFERENTES: {d.WorstInterCosine:F3}\n" +
+                $"limiar atual: {_engine.RecognitionThreshold:F3} — {d.Verdict}";
+        }
+        catch (Exception ex)
+        {
+            _lblGalleryDiag.ForeColor = Color.DarkRed;
+            _lblGalleryDiag.Text = "Falha ao medir: " + ex.Message;
+        }
+    }
+
     private void ApplyAutoEnrollmentConfig()
     {
         float cosine = (float)_numAutoEnrollCosine.Value;
         int consecutive = (int)_numAutoEnrollConsecutive.Value;
         int cooldown = (int)_numAutoEnrollCooldown.Value * 1000;
         int backoff = (int)_numAutoEnrollBackoff.Value * 1000;
+        float novelty = (float)_numAutoEnrollNovelty.Value;
         if (_ckAutoEnrollEnabled.Checked)
-            _engine.ConfigureAutoEnrollment(cosine, consecutive, cooldown, backoff);
+            _engine.ConfigureAutoEnrollment(cosine, consecutive, cooldown, backoff, novelty);
         else
             _engine.DisableAutoEnrollment();
     }
@@ -1576,6 +1690,8 @@ public class MainForm : Form
             _numAutoEnrollConsecutive.Value = 3;
             _numAutoEnrollCooldown.Value = 30;
             _numAutoEnrollBackoff.Value = 120;
+            _numAutoEnrollNovelty.Value = 0.90M;
+            _numMinCosine.Value = (decimal)Math.Round(_engine.RecognitionThreshold, 3);
             ApplyAutoEnrollmentConfig();
 
             _cboCamera.SelectedIndex = Math.Clamp(_config.CameraIndex, 0, 9);
@@ -1600,6 +1716,9 @@ public class MainForm : Form
         {
             _loadingUi = false;
         }
+
+        // Fora do guard: a medicao e O(n2) e so serve para informar a UI.
+        RefreshGalleryDiagnostics();
     }
 
     private void ReloadUserCombo()

@@ -24,17 +24,31 @@ public sealed class FaceRecognizerService : IDisposable
     private int _embeddingDim = 0;
     private float _inputScale = 1.0f;
     private Scalar _inputMean = Scalar.All(0);
-    private float _minimumCosine = 0.363f;
+    // 0.363 é o valor recomendado pelo SFace e serve para distinguir UMA pessoa.
+    // Com duas ou mais, ele fica ABAIXO do cosseno que pessoas diferentes já
+    // alcançam entre si (medido: 0,376 entre Victor e Ailton), e aí uma pessoa
+    // passa a "vencer" a outra. 0,42 fica acima do pior caso observado e abaixo
+    // do pior match legítimo (0,474). Ajustável na UI, com diagnóstico ao vivo.
+    private float _minimumCosine = 0.42f;
     private float _minimumMargin = 0.06f;
     private float _selfSimilarityFactor = 0.80f;
-    private int _maxPosesPerUser = 20;
+
+    /// <summary>Teto de poses por pessoa. Espelha UserManager.MaxFaceTemplatesPerUser.</summary>
+    public const int MaxPosesPerUser = 100;
+    private int _maxPosesPerUser = MaxPosesPerUser;
 
     // --- Auto-enrollment adaptativo (aprendizado por repetição) ---
     private float _autoEnrollMinCosine = 0.55f;
     private int _autoEnrollMinConsecutive = 3;
     private int _autoEnrollCooldownMs = 30_000;
     private int _autoEnrollBackoffMs = 120_000;
-    private float _autoEnrollDuplicateCosine = 0.995f;
+    // "Já tenho esse rosto": rejeita qualquer pose que seja parecida demais com
+    // ALGUMA que já existe. Medido nas tuas galerias, poses da mesma pessoa
+    // ficam entre 0,64 (ângulo bem diferente) e 0,93 (mesmo ângulo). Então 0,90
+    // separa "mesmo ângulo de novo" de "ângulo novo de verdade" — que é
+    // exatamente o que faz as 100 poses valerem a pena em vez de encher de
+    // cópia. Com 0,995 (o valor anterior) 100 poses viravam 100 quase-cópias.
+    private float _autoEnrollDuplicateCosine = 0.90f;
     private volatile bool _autoEnrollEnabled = true;
     private readonly Dictionary<string, int> _consecutiveHits = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _nextEligibleAt = new(StringComparer.OrdinalIgnoreCase);
@@ -42,6 +56,21 @@ public sealed class FaceRecognizerService : IDisposable
 
     /// <summary>Galeria: nome do usuário → várias poses L2-normalizadas.</summary>
     private readonly Dictionary<string, List<float[]>> _gallery = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// SelfSimilarity é O(n²): com 100 poses são ~5.000 pares por usuário, e ela
+    /// roda a cada reconhecimento. Guardar o resultado e invalidar só quando a
+    /// galeria muda evita pagar isso 22x por segundo.
+    /// </summary>
+    private readonly Dictionary<string, float> _selfSimilarityCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private void InvalidateSelfSimilarity()
+    {
+        lock (_gallery)
+        {
+            _selfSimilarityCache.Clear();
+        }
+    }
 
     public FaceRecognizerService(string modelPath)
     {
@@ -68,15 +97,18 @@ public sealed class FaceRecognizerService : IDisposable
     public string ModelTypeName => _modelType.ToString();
 
     public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3,
-        int cooldownMs = 30_000, int backoffMs = 120_000)
+        int cooldownMs = 30_000, int backoffMs = 120_000, float noveltyCosine = 0.90f)
     {
         _autoEnrollMinCosine = minCosine;
         _autoEnrollMinConsecutive = minConsecutive;
         _autoEnrollCooldownMs = Math.Max(5_000, cooldownMs);
         _autoEnrollBackoffMs = Math.Max(_autoEnrollCooldownMs, backoffMs);
+        _autoEnrollDuplicateCosine = Math.Clamp(noveltyCosine, 0.50f, 0.999f);
         _autoEnrollEnabled = true;
-        LoggerService.Info($"Auto-enrollment configurado: minCosine={minCosine:F2}, minConsecutive={minConsecutive}, cooldown={_autoEnrollCooldownMs}ms, backoff={_autoEnrollBackoffMs}ms, limite={_maxPosesPerUser} poses");
+        LoggerService.Info($"Auto-enrollment configurado: minCosine={minCosine:F2}, minConsecutive={minConsecutive}, cooldown={_autoEnrollCooldownMs}ms, backoff={_autoEnrollBackoffMs}ms, novelty={_autoEnrollDuplicateCosine:F2}, limite={_maxPosesPerUser} poses");
     }
+
+    public float AutoEnrollNoveltyCosine => _autoEnrollDuplicateCosine;
 
     public void DisableAutoEnrollment()
     {
@@ -104,6 +136,7 @@ public sealed class FaceRecognizerService : IDisposable
             // Re-cadastro manual pode ter libertado espaço: limpa o aviso de
             // limite para que ele volte a valer no próximo preenchimento.
             _capLogged.Clear();
+            _selfSimilarityCache.Clear();
             ResetAutoEnrollmentCounters();
         }
         LoggerService.Info($"Galeria facial resetada: {DescribeGallery()}");
@@ -116,8 +149,88 @@ public sealed class FaceRecognizerService : IDisposable
         {
             if (_gallery.Count == 0) return "galeria vazia";
             return string.Join(", ", _gallery.Select(g =>
-                $"{g.Key}:{g.Value.Count} poses (auto={SelfSimilarity(g.Value):F3})"));
+                $"{g.Key}:{g.Value.Count} poses (auto={SelfSimilarityCached(g.Key, g.Value):F3})"));
         }
+    }
+
+    /// <summary>Como as galerias se separam entre si, e se o limiar é seguro.</summary>
+    public sealed record GalleryDiagnostic(
+        int PoseCount,
+        float WorstIntraCosine,
+        float WorstInterCosine,
+        bool ThresholdIsSafe,
+        string Verdict);
+
+    /// <summary>
+    /// Mede, a partir das poses já gravadas, o pior cosseno entre pessoas
+    /// diferentes e o pior cossino de um match legítimo da mesma pessoa
+    /// (leave-one-out). É o que revela a confusão "eu virei fulano": se o
+    /// limiar estiver abaixo do cosseno entre pessoas, uma pessoa sempre vence
+    /// a outra. Custo O(n²) e não deve ser chamado por frame.
+    /// </summary>
+    public GalleryDiagnostic? DiagnoseGallery()
+    {
+        lock (_gallery)
+        {
+            var users = _gallery.Where(g => g.Value.Count >= 2).ToList();
+            if (users.Count == 0) return null;
+
+            // Pior match da mesma pessoa, sem contar a própria pose consigo mesma.
+            var worstIntra = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, templates) in users)
+            {
+                float worst = float.MaxValue;
+                for (int i = 0; i < templates.Count; i++)
+                {
+                    float bestOther = -1f;
+                    for (int j = 0; j < templates.Count; j++)
+                    {
+                        if (i == j) continue;
+                        float c = Cosine(templates[i], templates[j]);
+                        if (c > bestOther) bestOther = c;
+                    }
+                    if (bestOther >= 0f && bestOther < worst) worst = bestOther;
+                }
+                worstIntra[name] = worst == float.MaxValue ? 0f : worst;
+            }
+
+            float worstInter = 0f;
+            for (int u = 0; u < users.Count; u++)
+            {
+                for (int v = u + 1; v < users.Count; v++)
+                {
+                    foreach (var a in users[u].Value)
+                        foreach (var b in users[v].Value)
+                        {
+                            float c = Cosine(a, b);
+                            if (c > worstInter) worstInter = c;
+                        }
+                }
+            }
+
+            float worstIntraAll = worstIntra.Count > 0 ? worstIntra.Values.Min() : 0f;
+            bool safe = _minimumCosine > worstInter;
+
+            string verdict = users.Count < 2
+                ? "so uma pessoa na galeria: nao ha confusao possivel"
+                : safe
+                    ? $"limiar {_minimumCosine:F3} esta acima do pior caso entre pessoas diferentes ({worstInter:F3})"
+                    : $"ATENCAO: limiar {_minimumCosine:F3} esta ABAIXO do pior caso entre pessoas diferentes ({worstInter:F3}). Uma pessoa pode ser identificada como a outra.";
+
+            return new GalleryDiagnostic(
+                users.Sum(u => u.Value.Count), worstIntraAll, worstInter, safe, verdict);
+        }
+    }
+
+    public float MinimumCosine => _minimumCosine;
+
+    public void SetMinimumCosine(float value)
+    {
+        lock (_gallery)
+        {
+            _minimumCosine = Math.Clamp(value, 0.20f, 0.90f);
+        }
+        LoggerService.Info($"Limiar de reconhecimento ajustado para {_minimumCosine:F3}");
     }
 
     public void ResetAutoEnrollmentCounters()
@@ -174,14 +287,8 @@ public sealed class FaceRecognizerService : IDisposable
         return emb == null ? null : RecognizeEmbedding(emb);
     }
 
-    /// <summary>
-    /// Casa um embedding contra a galeria.
-    /// <paramref name="onLearned"/> recebe (usuário, embedding) quando o
-    /// auto-enrollment decide que a pose vale ser aprendida. É chamado dentro
-    /// do lock da galeria, então o consumidor deve apenas enfileirar.
-    /// </summary>
-    public (string Name, float Confidence)? RecognizeEmbedding(
-        float[] embedding, Action<string, float[]>? onLearned = null)
+    /// <summary>Casa um embedding contra a galeria.</summary>
+    public (string Name, float Confidence)? RecognizeEmbedding(float[] embedding)
     {
         if (embedding is not { Length: > 0 }) return null;
         if (!IsUsable(embedding)) return null;
@@ -210,7 +317,7 @@ public sealed class FaceRecognizerService : IDisposable
                     secondCos = bestCos;
                     bestCos = userBest;
                     best = name;
-                    bestSelf = SelfSimilarity(templates);
+                    bestSelf = SelfSimilarityCached(name, templates);
                 }
                 else if (userBest > secondCos)
                 {
@@ -224,16 +331,12 @@ public sealed class FaceRecognizerService : IDisposable
 
             if (bestSelf > 0f && bestCos < bestSelf * _selfSimilarityFactor) return null;
 
-            // Só a decisão sai daqui; quem grava (memória + disco) é a thread
-            // de escrita, o que tira o I/O do caminho quente do reconhecimento.
-            if (EvaluateAutoEnroll(best, embedding, bestCos) == AutoEnrollDecision.Accepted)
-            {
-                // O buffer pertence a quem chamou e pode ser reaproveitado no
-                // próximo quadro, então a fila recebe uma cópia própria.
-                try { onLearned?.Invoke(best, (float[])embedding.Clone()); }
-                catch (Exception ex) { LoggerService.Warn($"Falha no callback de aprendizado: {ex.Message}"); }
-            }
-
+            // Deliberadamente NÃO decide aprendizado aqui. O vencedor de um
+            // único quadro é instável: quando duas pessoas se parecem, ele
+            // alterna entre elas a cada frame. Aprender a partir disso cria um
+            // loop de reforço — a pose errada entra na galeria errada, o que
+            // torna o erro mais forte no frame seguinte. O aprendizado é
+            // decidido por quem já confirmou a identidade estável.
             return (best, bestCos);
         }
     }
@@ -326,6 +429,7 @@ public sealed class FaceRecognizerService : IDisposable
             if (templates.Any(t => Cosine(t, normalized) > _autoEnrollDuplicateCosine)) return false;
 
             templates.Add(normalized);
+            _selfSimilarityCache.Remove(name);
             return true;
         }
     }
@@ -341,7 +445,11 @@ public sealed class FaceRecognizerService : IDisposable
             if (_gallery.TryGetValue(name, out var templates))
             {
                 int idx = templates.FindIndex(t => Cosine(t, normalized) > 0.9999f);
-                if (idx >= 0) templates.RemoveAt(idx);
+                if (idx >= 0)
+                {
+                    templates.RemoveAt(idx);
+                    _selfSimilarityCache.Remove(name);
+                }
             }
         }
     }
@@ -355,6 +463,15 @@ public sealed class FaceRecognizerService : IDisposable
             sumSq += (double)v[i] * v[i];
         }
         return sumSq > 1e-6;
+    }
+
+    /// <summary>SelfSimilarity memoizada por usuário. Exige o lock da galeria.</summary>
+    private float SelfSimilarityCached(string name, List<float[]> templates)
+    {
+        if (_selfSimilarityCache.TryGetValue(name, out float cached)) return cached;
+        float computed = SelfSimilarity(templates);
+        _selfSimilarityCache[name] = computed;
+        return computed;
     }
 
     private static float SelfSimilarity(List<float[]> templates)

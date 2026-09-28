@@ -209,10 +209,18 @@ public sealed class CaptureEngine : IDisposable
     }
 
     public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3,
-        int cooldownMs = 30_000, int backoffMs = 120_000)
+        int cooldownMs = 30_000, int backoffMs = 120_000, float noveltyCosine = 0.90f)
     {
-        _faceRecognizer.ConfigureAutoEnrollment(minCosine, minConsecutive, cooldownMs, backoffMs);
+        _faceRecognizer.ConfigureAutoEnrollment(minCosine, minConsecutive, cooldownMs, backoffMs, noveltyCosine);
     }
+
+    public void SetMinimumCosine(float value) => _faceRecognizer.SetMinimumCosine(value);
+
+    public FaceRecognizerService.GalleryDiagnostic? DiagnoseFaceGallery() => _faceRecognizer.DiagnoseGallery();
+
+    public float RecognitionThreshold => _faceRecognizer.MinimumCosine;
+
+    public float AutoEnrollNovelty => _faceRecognizer.AutoEnrollNoveltyCosine;
 
     public void DisableAutoEnrollment()
     {
@@ -1290,9 +1298,7 @@ public sealed class CaptureEngine : IDisposable
         using (aligned)
         {
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
-            var match = embedding == null
-                ? null
-                : _faceRecognizer.RecognizeEmbedding(embedding, EnqueueEmbeddingWrite);
+            var match = embedding == null ? null : _faceRecognizer.RecognizeEmbedding(embedding);
             if (embedding == null)
             {
                 _lastFaceLabels[0] = "MODELO INDISPONIVEL";
@@ -1320,6 +1326,12 @@ public sealed class CaptureEngine : IDisposable
             }
 
             _lastFaceLabels[0] = $"{result.Name} {result.Confidence:P0}";
+
+            // Aprendizado só a partir daqui, com a identidade já confirmada
+            // acima. Antes, uma pose que ganhasse 3 frames seguidos por acidente
+            // entrava na galeria errada e reforçava o próprio erro.
+            TryAutoEnrollConfirmed(result.Name, embedding, result.Confidence);
+
             TryPersistRecognitionSample(result.Name, embedding, now);
             return UpdateFaceCaptureGate(result.Name, now);
         }
@@ -1442,9 +1454,7 @@ public sealed class CaptureEngine : IDisposable
         using (aligned)
         {
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
-            var match = embedding == null
-                ? null
-                : _faceRecognizer.RecognizeEmbedding(embedding, EnqueueEmbeddingWrite);
+            var match = embedding == null ? null : _faceRecognizer.RecognizeEmbedding(embedding);
             _lastFaceLabels[labelIndex] = embedding == null
                 ? "MODELO INDISPONIVEL"
                 : match is { } result ? $"{result.Name} {result.Confidence:P0}" : "DESCONHECIDO";
@@ -1509,6 +1519,28 @@ public sealed class CaptureEngine : IDisposable
 
         if (!string.Equals(previous, user, StringComparison.OrdinalIgnoreCase))
             LoggerService.Info($"Identidade facial confirmada: {user} (anterior: {previous ?? "-"})");
+    }
+
+    /// <summary>
+    /// Decide o aprendizado de uma pose, mas só para a identidade que o motor
+    /// acabou de confirmar (o que exigiu <see cref="FaceConfirmSeconds"/> de
+    /// reconhecimento estável). É a barreira contra o loop de reforço: uma pose
+    /// que ganhasse a corrida por 3 frames seguidos não entra em nada.
+    /// </summary>
+    private void TryAutoEnrollConfirmed(string user, float[] embedding, float confidence)
+    {
+        if (embedding is not { Length: > 0 }) return;
+        if (!string.Equals(user, _confirmedUser, StringComparison.OrdinalIgnoreCase)) return;
+
+        if (_faceRecognizer.EvaluateAutoEnroll(user, embedding, confidence) !=
+            FaceRecognizerService.AutoEnrollDecision.Accepted)
+        {
+            return;
+        }
+
+        // O buffer é do frame atual e pode ser reaproveitado: a fila recebe
+        // uma cópia própria.
+        EnqueueEmbeddingWrite(user, (float[])embedding.Clone());
     }
 
     private void TryPersistRecognitionSample(string user, float[] embedding, DateTime now)

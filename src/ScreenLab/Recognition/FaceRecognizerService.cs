@@ -222,6 +222,34 @@ public sealed class FaceRecognizerService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Ranking completo (todos os usuários, do maior cosseno para o menor) sem
+    /// aplicar nenhum corte. Existe para o diagnóstico: quando o app chama uma
+    /// pessoa de outra, é preciso ver o quanto cada uma chegou perto e qual a
+    /// diferença entre as duas, não só o vencedor.
+    /// </summary>
+    public List<(string Name, float Cosine)> RankAll(float[] embedding)
+    {
+        var ranking = new List<(string, float)>();
+        if (embedding is not { Length: > 0 } || !IsUsable(embedding)) return ranking;
+
+        lock (_gallery)
+        {
+            foreach (var (name, templates) in _gallery)
+            {
+                float best = -1f;
+                foreach (var t in templates)
+                {
+                    float c = Cosine(embedding, t);
+                    if (c > best) best = c;
+                }
+                if (best >= 0f) ranking.Add((name, best));
+            }
+        }
+        ranking.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        return ranking;
+    }
+
     public float MinimumCosine => _minimumCosine;
 
     public void SetMinimumCosine(float value)

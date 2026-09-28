@@ -1665,10 +1665,20 @@ public class MainForm : Form
             return;
         }
 
+        // Mostra PARA QUEM está aprendendo. Sem isso não há como saber, depois
+        // que a tela troca de cor, se gravou na pessoa certa — que era
+        // exatamente o que acontecia: gravava em Ailton e parecia funcionar.
+        string alvo = _users.ActiveUser;
+        string detectado = _engine.DetectedUser;
+        bool conflito = !string.IsNullOrEmpty(detectado)
+            && !string.Equals(detectado, alvo, StringComparison.OrdinalIgnoreCase);
+
         _btnLearnFace.Enabled = false;
-        _btnLearnFace.Text = "APRENDENDO...";
+        _btnLearnFace.Text = $"APRENDENDO PARA {alvo.ToUpper()}...";
         _btnLearnFace.ButtonColor = Color.FromArgb(180, 120, 0);
-        ApplyStatus("Aprendendo rosto atual — olhe para a câmera de rosto");
+        ApplyStatus(conflito
+            ? $"O app acha que quem está na câmera é '{detectado}', mas vai aprender em '{alvo}'"
+            : $"Aprendendo o rosto atual em '{alvo}' — olhe para a câmera de rosto");
 
         _engine.LearnCurrentFace();
     }
@@ -1678,21 +1688,31 @@ public class MainForm : Form
         SafeBeginInvoke(() =>
         {
             _btnLearnFace.Enabled = true;
-            _btnLearnFace.Text = "APRENDER ROSTO ATUAL (F10)";
             _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170);
             ApplyStatus(message);
+
+            // O texto precisa dizer o resultado, não só mudar de cor: o
+            // operador só tem alguns segundos para olhar, e "mudou de cor"
+            // não diz se gravou e em quem.
+            const string idle = "APRENDER ROSTO ATUAL (F10)";
             if (success)
             {
                 UpdateEnrollmentUi();
-                _btnLearnFace.ButtonColor = Color.FromArgb(0, 180, 60);
-                _ = Task.Delay(800).ContinueWith(_ => SafeBeginInvoke(() =>
-                    _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170)));
+                _btnLearnFace.Text = "✓ " + message.ToUpperInvariant();
+                _btnLearnFace.ButtonColor = Color.FromArgb(0, 170, 70);
+                _ = Task.Delay(4000).ContinueWith(_ => SafeBeginInvoke(() =>
+                {
+                    if (_btnLearnFace.Text.StartsWith("✓")) _btnLearnFace.Text = idle;
+                }));
             }
             else
             {
+                _btnLearnFace.Text = "✗ FALHOU";
                 _btnLearnFace.ButtonColor = Color.FromArgb(200, 60, 60);
-                _ = Task.Delay(1500).ContinueWith(_ => SafeBeginInvoke(() =>
-                    _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170)));
+                _ = Task.Delay(3000).ContinueWith(_ => SafeBeginInvoke(() =>
+                {
+                    if (_btnLearnFace.Text.StartsWith("✗")) _btnLearnFace.Text = idle;
+                }));
             }
         });
     }

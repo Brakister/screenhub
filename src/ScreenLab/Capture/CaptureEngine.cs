@@ -1204,6 +1204,64 @@ public sealed class CaptureEngine : IDisposable
         return DetectHaarFaces(gray);
     }
 
+    /// <summary>
+    /// Quanto a cabeça está virada, em graus (0 = de frente). Mede a assimetria
+    /// das distâncias nariz-olho: de frente as duas são iguais; virado, uma
+    /// cresce e a outra encurta. Serve para o app desconfiar do embedding
+    /// quando o rosto está de perfil — é quando a galeria de uma pessoa passa
+    /// a parecer com a de outra, porque o modelo tem menos informação.
+    /// </summary>
+    private static double EstimateHeadYaw(Point2f[]? landmarks)
+    {
+        if (landmarks is not { Length: >= 5 }) return 0;
+        double dRight = Distance(landmarks[0], landmarks[2]);
+        double dLeft = Distance(landmarks[1], landmarks[2]);
+        double soma = dRight + dLeft;
+        if (soma < 1e-6) return 0;
+        double k = (dRight - dLeft) / soma;   // -1..1, 0 = perfeitamente de frente
+        return Math.Asin(Math.Clamp(k, -1, 1)) * 180.0 / Math.PI;
+    }
+
+    private static double Distance(Point2f a, Point2f b)
+    {
+        double dx = a.X - b.X, dy = a.Y - b.Y;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    private DateTime _lastRankLogAt = DateTime.MinValue;
+    private static readonly TimeSpan RankLogInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Registra periodicamente como o rosto da frente está se comparando com
+    /// cada galeria. Sem isso, "ele chamou eu de Ailton" não tem como ser
+    /// diagnosticado: o log antigo só guardava o vencedor.
+    /// </summary>
+    private void LogRecognitionRanking(string user, float[] embedding, double yaw)
+    {
+        DateTime now = DateTime.Now;
+        if (now - _lastRankLogAt < RankLogInterval) return;
+        _lastRankLogAt = now;
+
+        var ranking = _faceRecognizer.RankAll(embedding);
+        if (ranking.Count == 0) return;
+
+        float limiar = _faceRecognizer.MinimumCosine;
+        float margemMin = 0.06f;
+        string todos = string.Join(", ", ranking.Select(r => $"{r.Name}={r.Cosine:F3}"));
+
+        float melhor = ranking[0].Cosine;
+        float segundo = ranking.Count > 1 ? ranking[1].Cosine : 0f;
+        float margem = melhor - segundo;
+        bool acimaDoCorte = melhor >= limiar;
+        bool margemOk = margem >= margemMin;
+
+        LoggerService.Info(
+            $"[Rank] perfil={yaw:F0}° Escolido={user} | {todos} | "
+            + $"limiar={limiar:F3} acima={(acimaDoCorte ? "sim" : "NAO")} "
+            + $"margem={margem:F3} {(margemOk ? "ok" : "PEQUENA")} "
+            + $"| {(acimaDoCorte && margemOk ? "reconhecido" : "descartado")}");
+    }
+
     private readonly record struct FaceHit(Rect Box, Point2f[]? Landmarks, float Score);
 
     private static (Rect[] Faces, Point2f[][] Landmarks) DetectHaarFaces(Mat gray)
@@ -1360,13 +1418,24 @@ public sealed class CaptureEngine : IDisposable
                 ResetFaceDwell();
                 return false;
             }
+
+            // Mede o quanto está de perfil e registra a comparação completa,
+            // mesmo quando o frame é descartado. É o que permite entender
+            // depois por que o app escolheu um nome e não o outro.
+            double yaw = EstimateHeadYaw(cropLandmarks);
+
             if (match is not { } result)
             {
-                _lastFaceLabels[0] = "DESCONHECIDO";
+                LogRecognitionRanking("ninguem", embedding, yaw);
+                _lastFaceLabels[0] = yaw > 25
+                    ? $"DESCONHECIDO (perfil {yaw:F0}°)"
+                    : "DESCONHECIDO";
                 ResetTrackedIdentity();
                 ResetFaceDwell();
                 return false;
             }
+
+            LogRecognitionRanking(result.Name, embedding, yaw);
 
             bool confirmed = UpdateIdentityState(result.Name, now, out double remainingSeconds);
             if (!confirmed)
@@ -1379,7 +1448,8 @@ public sealed class CaptureEngine : IDisposable
                 return false;
             }
 
-            _lastFaceLabels[0] = $"{result.Name} {result.Confidence:P0}";
+            _lastFaceLabels[0] = $"{result.Name} {result.Confidence:P0}"
+                + (yaw > 25 ? $" (perfil {yaw:F0}°)" : "");
 
             // Aprendizado só a partir daqui, com a identidade já confirmada
             // acima. Antes, uma pose que ganhasse 3 frames seguidos por acidente

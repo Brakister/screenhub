@@ -111,6 +111,7 @@ public class MainForm : Form
     // Auto-enrollment
     private CheckBox _ckAutoSwitchOperator = null!;
     private NumericUpDown _numMinCosine = null!;
+    private NumericUpDown _numMinMargin = null!;
     private NumericUpDown _numAutoEnrollCosine = null!;
     private NumericUpDown _numAutoEnrollConsecutive = null!;
     private NumericUpDown _numAutoEnrollCooldown = null!;
@@ -821,14 +822,34 @@ public class MainForm : Form
             RefreshGalleryDiagnostics();
         };
         gb.Controls.Add(_numMinCosine);
+
+        AddLabel(gb, "Distancia minima do 2o colocado:", 150, y);
+        _numMinMargin = new NumericUpDown
+        {
+            Minimum = 0M,
+            Maximum = 0.60M,
+            DecimalPlaces = 3,
+            Increment = 0.01M,
+            Width = 110,
+            Location = new Point(220, y - 3),
+            Value = 0.15M,
+        };
+        _numMinMargin.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _engine.SetMinimumMargin((float)_numMinMargin.Value);
+            RefreshGalleryDiagnostics();
+        };
+        gb.Controls.Add(_numMinMargin);
         y += 28;
 
         var hintCosine = new Label
         {
             Text =
-                "Acima do cosseno entre pessoas diferentes, abaixo do pior match\n" +
-                "legitimo. Com valor baixo demais, uma pessoa passa a ser\n" +
-                "identificada como a outra. Medir a separacao no grupo abaixo.",
+                "Limiar: cosseno minimo para aceitar. Margem: quanto o primeiro\n" +
+                "colocado tem que passar do segundo. Em cima da margem, o app\n" +
+                "prefere dizer DESCONHECIDO a arriscar o nome errado — util\n" +
+                "quando duas pessoas se parecem. Medir a separacao no grupo abaixo.",
             AutoSize = true,
             ForeColor = Color.DimGray,
             Location = new Point(12, y),
@@ -1032,7 +1053,7 @@ public class MainForm : Form
             _lblGalleryDiag.Text =
                 $"{d.PoseCount} poses | pior match da MESMA pessoa: {d.WorstIntraCosine:F3}\n" +
                 $"pior match entre PESSOAS DIFERENTES: {d.WorstInterCosine:F3}\n" +
-                $"limiar atual: {_engine.RecognitionThreshold:F3} — {d.Verdict}";
+                $"limiar {_engine.RecognitionThreshold:F3} | margem {_engine.RecognitionMargin:F3} — {d.Verdict}";
         }
         catch (Exception ex)
         {
@@ -1750,6 +1771,7 @@ public class MainForm : Form
             _numAutoEnrollBackoff.Value = 120;
             _numAutoEnrollNovelty.Value = 0.90M;
             _numMinCosine.Value = (decimal)Math.Round(_engine.RecognitionThreshold, 3);
+            _numMinMargin.Value = (decimal)Math.Round(_engine.RecognitionMargin, 3);
             ApplyAutoEnrollmentConfig();
 
             _cboCamera.SelectedIndex = Math.Clamp(_config.CameraIndex, 0, 9);

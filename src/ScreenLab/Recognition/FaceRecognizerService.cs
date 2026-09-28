@@ -24,13 +24,11 @@ public sealed class FaceRecognizerService : IDisposable
     private int _embeddingDim = 0;
     private float _inputScale = 1.0f;
     private Scalar _inputMean = Scalar.All(0);
-    // 0.363 é o valor recomendado pelo SFace e serve para distinguir UMA pessoa.
-    // Com duas ou mais, ele fica ABAIXO do cosseno que pessoas diferentes já
-    // alcançam entre si (medido: 0,376 entre Victor e Ailton), e aí uma pessoa
-    // passa a "vencer" a outra. 0,42 fica acima do pior caso observado e abaixo
-    // do pior match legítimo (0,474). Ajustável na UI, com diagnóstico ao vivo.
+    // estes dois valores são sobrescritos em EnsureLoadedLocked, quando o
+    // modelo carrega e sabe o que é. O inicializador aqui é só uma rede de
+    // segurança para recognition antes do load.
     private float _minimumCosine = 0.42f;
-    private float _minimumMargin = 0.06f;
+    private float _minimumMargin = 0.15f;
     private float _selfSimilarityFactor = 0.80f;
 
     /// <summary>Teto de poses por pessoa. Espelha UserManager.MaxFaceTemplatesPerUser.</summary>
@@ -210,12 +208,16 @@ public sealed class FaceRecognizerService : IDisposable
 
             float worstIntraAll = worstIntra.Count > 0 ? worstIntra.Values.Min() : 0f;
             bool safe = _minimumCosine > worstInter;
+            float gap = worstIntraAll - worstInter;
+            bool wideGap = gap >= 2f * _minimumMargin;
 
             string verdict = users.Count < 2
                 ? "so uma pessoa na galeria: nao ha confusao possivel"
-                : safe
-                    ? $"limiar {_minimumCosine:F3} esta acima do pior caso entre pessoas diferentes ({worstInter:F3})"
-                    : $"ATENCAO: limiar {_minimumCosine:F3} esta ABAIXO do pior caso entre pessoas diferentes ({worstInter:F3}). Uma pessoa pode ser identificada como a outra.";
+                : !safe
+                    ? $"ATENCAO: limiar {_minimumCosine:F3} esta ABAIXO do pior caso entre pessoas diferentes ({worstInter:F3}). Uma pessoa pode ser identificada como a outra."
+                    : wideGap
+                        ? $"limiar {_minimumCosine:F3} esta acima do pior caso entre pessoas diferentes ({worstInter:F3})"
+                        : $"limiar ok, mas a folga e curta: pior match de quem e {worstIntraAll:F3} contra pior vicio de {worstInter:F3}, folga de {gap:F3}. Com margem minima de {_minimumMargin:F3}, varios casos ficam no limite e o app pode responder DESCONHECIDO onde antes acertava.";
 
             return new GalleryDiagnostic(
                 users.Sum(u => u.Value.Count), worstIntraAll, worstInter, safe, verdict);
@@ -259,6 +261,17 @@ public sealed class FaceRecognizerService : IDisposable
             _minimumCosine = Math.Clamp(value, 0.20f, 0.90f);
         }
         LoggerService.Info($"Limiar de reconhecimento ajustado para {_minimumCosine:F3}");
+    }
+
+    public float MinimumMargin => _minimumMargin;
+
+    public void SetMinimumMargin(float value)
+    {
+        lock (_gallery)
+        {
+            _minimumMargin = Math.Clamp(value, 0f, 0.60f);
+        }
+        LoggerService.Info($"Margem minima de reconhecimento ajustada para {_minimumMargin:F3}");
     }
 
     public void ResetAutoEnrollmentCounters()
@@ -574,8 +587,19 @@ public sealed class FaceRecognizerService : IDisposable
                 _embeddingDim = 128;
                 _inputScale = 1.0f;           // SFace usa [0,255]
                 _inputMean = Scalar.All(0);
-                _minimumCosine = 0.363f;
-                _minimumMargin = 0.06f;
+                // 0,363 é o valor do SFace, feito para distinguir UMA pessoa.
+                // Com duas, ele fica ABAIXO do cosseno que elas já alcançam
+                // entre si. Medido nas galerias do Victor e do Ailton: 0,42
+                // separa melhor sem perder quem é de frente.
+                _minimumCosine = 0.42f;
+                // A margem passou de 0,06 para 0,15 por causa do log de 11:04-11:10
+                // (48 amostras com o cosseno de cada galeria lado a lado). As
+                // vitórias do Ailton que a gente duvida tinham margem 0,072 /
+                // 0,092 / 0,097; com 0,15 elas caem para "ninguém" em vez de
+                // virar um nome errado. Custa umas 7 das 25 vitórias do
+                // Victor, que passam a dizer "ninguém" — é o trade-off certo:
+                // melhor não saber do que errar o nome de quem entra.
+                _minimumMargin = 0.15f;
                 _selfSimilarityFactor = 0.80f;
                 LoggerService.Info($"Modelo SFace detectado (128-d): {_modelPath}");
             }

@@ -16,3 +16,7 @@ publicacao/
 # Capturas temporarias do ambiente
 shot_current.png
 publish/
+
+# Lixo de investigacao: probes com uma copia de 61 MB do OpenCvSharpExtern.dll
+# e PNGs de debug. Ja esteve no remoto, mas nao deve voltar.
+tmp_probe/

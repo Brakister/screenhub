@@ -250,6 +250,10 @@ public sealed class CaptureEngine : IDisposable
 
     public void SetMinimumCosine(float value) => _faceRecognizer.SetMinimumCosine(value);
 
+    public void SetMinimumMargin(float value) => _faceRecognizer.SetMinimumMargin(value);
+
+    public float RecognitionMargin => _faceRecognizer.MinimumMargin;
+
     public FaceRecognizerService.GalleryDiagnostic? DiagnoseFaceGallery() => _faceRecognizer.DiagnoseGallery();
 
     public float RecognitionThreshold => _faceRecognizer.MinimumCosine;
@@ -1246,7 +1250,7 @@ public sealed class CaptureEngine : IDisposable
         if (ranking.Count == 0) return;
 
         float limiar = _faceRecognizer.MinimumCosine;
-        float margemMin = 0.06f;
+        float margemMin = _faceRecognizer.MinimumMargin;
         string todos = string.Join(", ", ranking.Select(r => $"{r.Name}={r.Cosine:F3}"));
 
         float melhor = ranking[0].Cosine;

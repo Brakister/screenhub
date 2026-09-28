@@ -747,7 +747,9 @@ public sealed class CaptureEngine : IDisposable
                 // --- LEITURA DA CÂMERA DO ROSTO (apenas quando necessário) ---
                 bool faceReadOk = false;
                 Mat? faceFrame = null;
-                bool needFaceFrame = _pendingLearnFace || _pendingManualTrigger != "" || _config.FaceEnabled || _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs;
+                bool needFaceFrame = _pendingLearnFace 
+                    || string.Equals(_pendingManualTrigger, "Manual c/ Rosto", StringComparison.OrdinalIgnoreCase)
+                    || _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs;
 
                 if (needFaceFrame && EnsureFaceCameraOpen())
                 {
@@ -912,38 +914,50 @@ public sealed class CaptureEngine : IDisposable
             return true;
         }
 
-        try
+        // Try MSMF first (Media Foundation) - delivers 1080p@30fps like Windows Camera
+        // Fall back to DSHOW if MSMF fails
+        var apis = new[] { VideoCaptureAPIs.MSMF, VideoCaptureAPIs.DSHOW };
+
+        foreach (var api in apis)
         {
-            var cap = new VideoCapture(_config.CameraIndex, VideoCaptureAPIs.DSHOW);
-            if (!cap.IsOpened())
+            try
             {
-                cap.Dispose();
-                _cameraFailStreak++;
-                LogCameraUnavailable();
-                return false;
+                var cap = new VideoCapture(_config.CameraIndex, api);
+                if (!cap.IsOpened())
+                {
+                    cap.Dispose();
+                    continue;
+                }
+
+                // MSMF: don't force FourCC, let it negotiate (works at 1080p@30)
+                // DSHOW: force MJPG for compatibility
+                if (api == VideoCaptureAPIs.DSHOW)
+                {
+                    cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+                }
+                cap.Set(VideoCaptureProperties.Fps, 30);
+                if (_config.VideoWidth > 0)
+                    cap.Set(VideoCaptureProperties.FrameWidth, _config.VideoWidth);
+                if (_config.VideoHeight > 0)
+                    cap.Set(VideoCaptureProperties.FrameHeight, _config.VideoHeight);
+
+                _capture = cap;
+                _cameraFailStreak = 0;
+                LoggerService.Info(
+                    $"Câmera {_config.CameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{cap.Get(VideoCaptureProperties.Fps):0}fps");
+                StatusChanged?.Invoke($"Câmera {_config.CameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
+                return true;
             }
-
-            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
-            cap.Set(VideoCaptureProperties.Fps, 30);
-            if (_config.VideoWidth > 0)
-                cap.Set(VideoCaptureProperties.FrameWidth, _config.VideoWidth);
-            if (_config.VideoHeight > 0)
-                cap.Set(VideoCaptureProperties.FrameHeight, _config.VideoHeight);
-
-            _capture = cap;
-            _cameraFailStreak = 0;
-            LoggerService.Info(
-                $"Câmera {_config.CameraIndex} aberta em {cap.FrameWidth}x{cap.FrameHeight}");
-            StatusChanged?.Invoke($"Câmera {_config.CameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
-            return true;
+            catch (Exception ex)
+            {
+                LoggerService.Warn($"Falha ao abrir câmera {_config.CameraIndex} via {api}: {ex.Message}");
+                // Try next API
+            }
         }
-        catch (Exception ex)
-        {
-            LoggerService.Error($"Falha ao abrir câmera {_config.CameraIndex}", ex);
-            _cameraFailStreak++;
-            LogCameraUnavailable();
-            return false;
-        }
+
+        _cameraFailStreak++;
+        LogCameraUnavailable();
+        return false;
     }
 
     private bool EnsureFaceCameraOpen()

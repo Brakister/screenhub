@@ -23,8 +23,8 @@ public class AppConfig
     public int FaceCameraIndex { get; set; } = 1;
     public int VideoWidth { get; set; } = 1920;
     public int VideoHeight { get; set; } = 1080;
-    public int FaceVideoWidth { get; set; } = 1280;
-    public int FaceVideoHeight { get; set; } = 720;
+    public int FaceVideoWidth { get; set; } = 640;
+    public int FaceVideoHeight { get; set; } = 480;
 
     public bool PalmEnabled { get; set; } = false;
     public int PalmMinAreaPct { get; set; } = 3;

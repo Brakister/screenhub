@@ -32,9 +32,13 @@ public sealed class FaceRecognizerService : IDisposable
     // --- Auto-enrollment adaptativo (aprendizado por repetição) ---
     private float _autoEnrollMinCosine = 0.55f;
     private int _autoEnrollMinConsecutive = 3;
-    private int _autoEnrollCooldownMs = 5000;
+    private int _autoEnrollCooldownMs = 30_000;
+    private int _autoEnrollBackoffMs = 120_000;
+    private float _autoEnrollDuplicateCosine = 0.995f;
+    private volatile bool _autoEnrollEnabled = true;
     private readonly Dictionary<string, int> _consecutiveHits = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTime> _lastAutoEnroll = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _nextEligibleAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _capLogged = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Galeria: nome do usuário → várias poses L2-normalizadas.</summary>
     private readonly Dictionary<string, List<float[]>> _gallery = new(StringComparer.OrdinalIgnoreCase);
@@ -63,17 +67,21 @@ public sealed class FaceRecognizerService : IDisposable
 
     public string ModelTypeName => _modelType.ToString();
 
-    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3, int cooldownMs = 5000)
+    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3,
+        int cooldownMs = 30_000, int backoffMs = 120_000)
     {
         _autoEnrollMinCosine = minCosine;
         _autoEnrollMinConsecutive = minConsecutive;
-        _autoEnrollCooldownMs = cooldownMs;
-        LoggerService.Info($"Auto-enrollment configurado: minCosine={minCosine:F2}, minConsecutive={minConsecutive}, cooldown={cooldownMs}ms");
+        _autoEnrollCooldownMs = Math.Max(5_000, cooldownMs);
+        _autoEnrollBackoffMs = Math.Max(_autoEnrollCooldownMs, backoffMs);
+        _autoEnrollEnabled = true;
+        LoggerService.Info($"Auto-enrollment configurado: minCosine={minCosine:F2}, minConsecutive={minConsecutive}, cooldown={_autoEnrollCooldownMs}ms, backoff={_autoEnrollBackoffMs}ms, limite={_maxPosesPerUser} poses");
     }
 
     public void DisableAutoEnrollment()
     {
-        _autoEnrollMinConsecutive = int.MaxValue;
+        _autoEnrollEnabled = false;
+        ResetAutoEnrollmentCounters();
         LoggerService.Info("Auto-enrollment desabilitado");
     }
 
@@ -93,31 +101,12 @@ public sealed class FaceRecognizerService : IDisposable
                 if (normalized.Count > 0)
                     _gallery[name] = normalized;
             }
+            // Re-cadastro manual pode ter libertado espaço: limpa o aviso de
+            // limite para que ele volte a valer no próximo preenchimento.
+            _capLogged.Clear();
+            ResetAutoEnrollmentCounters();
         }
         LoggerService.Info($"Galeria facial resetada: {DescribeGallery()}");
-    }
-
-    /// <summary>Acrescenta uma pose ao usuário, mantendo o limite de poses.</summary>
-    public bool UpsertTemplate(string name, float[] embedding)
-    {
-        var normalized = Normalize(embedding);
-        if (normalized == null)
-            return false;
-
-        lock (_gallery)
-        {
-            if (!_gallery.TryGetValue(name, out var templates))
-                _gallery[name] = templates = new List<float[]>();
-
-            // Compara com toda a janela, não só com a última pose.
-            if (templates.Any(template => Cosine(template, normalized) > 0.995f))
-                return false;
-
-            templates.Add(normalized);
-            if (templates.Count > _maxPosesPerUser)
-                templates.RemoveRange(0, templates.Count - _maxPosesPerUser);
-            return true;
-        }
     }
 
     /// <summary>Info de diagnóstico.</summary>
@@ -131,27 +120,10 @@ public sealed class FaceRecognizerService : IDisposable
         }
     }
 
-    public bool AddLearningSample(string name, float[] embedding) => UpsertTemplate(name, embedding);
-
-    public bool AddLearningSample(string name, Mat face)
-    {
-        var emb = EmbedFace(face);
-        return emb != null && UpsertTemplate(name, emb);
-    }
-
-    public (int TotalUsers, int PendingHits, Dictionary<string, int> UserHits) GetAutoEnrollmentStats()
-    {
-        lock (_gallery)
-        {
-            var userHits = new Dictionary<string, int>(_consecutiveHits, StringComparer.OrdinalIgnoreCase);
-            return (_gallery.Count, _consecutiveHits.Values.Sum(), userHits);
-        }
-    }
-
     public void ResetAutoEnrollmentCounters()
     {
         _consecutiveHits.Clear();
-        _lastAutoEnroll.Clear();
+        _nextEligibleAt.Clear();
     }
 
     /// <summary>
@@ -202,8 +174,14 @@ public sealed class FaceRecognizerService : IDisposable
         return emb == null ? null : RecognizeEmbedding(emb);
     }
 
-    /// <summary>Casa um embedding contra a galeria.</summary>
-    public (string Name, float Confidence)? RecognizeEmbedding(float[] embedding)
+    /// <summary>
+    /// Casa um embedding contra a galeria.
+    /// <paramref name="onLearned"/> recebe (usuário, embedding) quando o
+    /// auto-enrollment decide que a pose vale ser aprendida. É chamado dentro
+    /// do lock da galeria, então o consumidor deve apenas enfileirar.
+    /// </summary>
+    public (string Name, float Confidence)? RecognizeEmbedding(
+        float[] embedding, Action<string, float[]>? onLearned = null)
     {
         if (embedding is not { Length: > 0 }) return null;
         if (!IsUsable(embedding)) return null;
@@ -246,56 +224,126 @@ public sealed class FaceRecognizerService : IDisposable
 
             if (bestSelf > 0f && bestCos < bestSelf * _selfSimilarityFactor) return null;
 
-            TryAutoEnroll(best, embedding, bestCos);
+            // Só a decisão sai daqui; quem grava (memória + disco) é a thread
+            // de escrita, o que tira o I/O do caminho quente do reconhecimento.
+            if (EvaluateAutoEnroll(best, embedding, bestCos) == AutoEnrollDecision.Accepted)
+            {
+                // O buffer pertence a quem chamou e pode ser reaproveitado no
+                // próximo quadro, então a fila recebe uma cópia própria.
+                try { onLearned?.Invoke(best, (float[])embedding.Clone()); }
+                catch (Exception ex) { LoggerService.Warn($"Falha no callback de aprendizado: {ex.Message}"); }
+            }
 
             return (best, bestCos);
         }
     }
 
-    private void TryAutoEnroll(string name, float[] embedding, float cosine)
+    /// <summary>Decisão do auto-enrollment para um embedding reconhecido.</summary>
+    public enum AutoEnrollDecision
     {
-        if (cosine < _autoEnrollMinCosine) return;
+        /// <summary>Ainda não é hora (contador ou cooldown em andamento).</summary>
+        TooEarly,
+        /// <summary>A pose é praticamente idêntica a outra já salva.</summary>
+        Duplicate,
+        /// <summary>A galeria do usuário já está cheia: nada é escrito.</summary>
+        AtCapacity,
+        /// <summary>Vale aprender — quem enfileira decide quando persistir.</summary>
+        Accepted,
+    }
+
+    /// <summary>
+    /// Avalia se o embedding vale ser aprendido, sem tocar na galeria nem no
+    /// disco. Quem chama faz o commit (memória + disco) num único lugar
+    /// serializado, o que garante que os dois nunca divirjam.
+    /// </summary>
+    public AutoEnrollDecision EvaluateAutoEnroll(string name, float[] embedding, float cosine)
+    {
+        if (!_autoEnrollEnabled) return AutoEnrollDecision.TooEarly;
+        if (cosine < _autoEnrollMinCosine) return AutoEnrollDecision.TooEarly;
 
         lock (_gallery)
         {
-            int hits = _consecutiveHits.GetValueOrDefault(name, 0) + 1;
-            _consecutiveHits[name] = hits;
+            _gallery.TryGetValue(name, out var templates);
 
-            if (hits < _autoEnrollMinConsecutive) return;
-
-            if (_lastAutoEnroll.TryGetValue(name, out var lastTime))
+            // learned: a galeria já cobre bem esse rosto. Não insere nada e não
+            // reescreve o config.json — é o caso que garante "já aprendeu, não
+            // reaprende". Enche as 20 poses e para; só volta por re-cadastro.
+            if (templates != null && templates.Count >= _maxPosesPerUser)
             {
-                var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
-                if (elapsed < _autoEnrollCooldownMs) return;
+                if (!_capLogged.TryGetValue(name, out _))
+                {
+                    _capLogged[name] = true;
+                    LoggerService.Info($"[Auto-enroll] '{name}' atingiu o limite de {_maxPosesPerUser} poses. Auto-enrollment pausado até o cadastro ser refeito.");
+                }
+                _consecutiveHits[name] = 0;
+                return AutoEnrollDecision.AtCapacity;
             }
 
-            bool added = UpsertTemplateInternal(name, embedding);
-            if (added)
+            int hits = _consecutiveHits.GetValueOrDefault(name, 0) + 1;
+            _consecutiveHits[name] = hits;
+            if (hits < _autoEnrollMinConsecutive) return AutoEnrollDecision.TooEarly;
+
+            // Cobre tanto o intervalo entre poses aceitas quanto o back-off
+            // aplicado depois de uma rejeição.
+            if (_nextEligibleAt.TryGetValue(name, out var next) && DateTime.UtcNow < next)
+                return AutoEnrollDecision.TooEarly;
+
+            var normalized = Normalize(embedding);
+            if (normalized == null) return AutoEnrollDecision.TooEarly;
+
+            // Quadro praticamente idêntico a uma pose já salva: rejeita e faz
+            // back-off. Antes o contador zerava aqui e a tentativa se repetia
+            // indefinidamente, a cada 3 reconhecimentos, sem nunca parar.
+            if (templates != null && templates.Any(t => Cosine(t, normalized) > _autoEnrollDuplicateCosine))
             {
-                _lastAutoEnroll[name] = DateTime.UtcNow;
-                LoggerService.Info($"[Auto-enroll] '{name}' - embedding adicionado à galeria (cos={cosine:F3}, hits={hits}). Total poses: {_gallery[name].Count}");
+                _consecutiveHits[name] = 0;
+                _nextEligibleAt[name] = DateTime.UtcNow.AddMilliseconds(_autoEnrollBackoffMs);
+                return AutoEnrollDecision.Duplicate;
             }
 
             _consecutiveHits[name] = 0;
+            _nextEligibleAt[name] = DateTime.UtcNow.AddMilliseconds(_autoEnrollCooldownMs);
+            return AutoEnrollDecision.Accepted;
         }
     }
 
-    private bool UpsertTemplateInternal(string name, float[] embedding)
+    /// <summary>
+    /// Grava a pose na galeria em memória, respeitando o limite por usuário.
+    /// Devolve false quando nada mudou — nesse caso o chamador NÃO deve tocar
+    /// no disco, e é isso que mantém o volume de escrita perto de zero.
+    /// </summary>
+    public bool CommitTemplate(string name, float[] embedding)
     {
         var normalized = Normalize(embedding);
-        if (normalized == null)
-            return false;
+        if (normalized == null) return false;
 
-        if (!_gallery.TryGetValue(name, out var templates))
-            _gallery[name] = templates = new List<float[]>();
+        lock (_gallery)
+        {
+            if (!_gallery.TryGetValue(name, out var templates))
+                _gallery[name] = templates = new List<float[]>();
 
-        if (templates.Any(template => Cosine(template, normalized) > 0.995f))
-            return false;
+            if (templates.Count >= _maxPosesPerUser) return false;
+            if (templates.Any(t => Cosine(t, normalized) > _autoEnrollDuplicateCosine)) return false;
 
-        templates.Add(normalized);
-        if (templates.Count > _maxPosesPerUser)
-            templates.RemoveRange(0, templates.Count - _maxPosesPerUser);
-        return true;
+            templates.Add(normalized);
+            return true;
+        }
+    }
+
+    /// <summary>Descarta da galeria em memória a pose que falhou ao ir para o disco.</summary>
+    public void RollbackTemplate(string name, float[] embedding)
+    {
+        var normalized = Normalize(embedding);
+        if (normalized == null) return;
+
+        lock (_gallery)
+        {
+            if (_gallery.TryGetValue(name, out var templates))
+            {
+                int idx = templates.FindIndex(t => Cosine(t, normalized) > 0.9999f);
+                if (idx >= 0) templates.RemoveAt(idx);
+            }
+        }
     }
 
     private static bool IsUsable(float[] v)

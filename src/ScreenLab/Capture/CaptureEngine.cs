@@ -60,6 +60,17 @@ public sealed class CaptureEngine : IDisposable
     /// <summary>Sem isso um cadastro travado (câmera/modelo) prendia a UI para sempre.</summary>
     private const int EnrollmentTimeoutSeconds = 240;
 
+    // --- Gravação de embeddings fora da thread da câmera -----------------------
+    // Escrever config.json leva ~4 ms (medido: 0,96 ms de serializar + 3,7 ms de
+    // WriteAllText em %APPDATA%). Feito dentro do loop de captura isso vira um
+    // soluço no processamento de frames, então tudo que precisa ir para o disco
+    // passa por esta fila, consumida por uma única thread. Serializar as
+    // escritas também evita duas threads reescrevendo o mesmo arquivo.
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(string User, float[] Embedding)> _pendingWrites = new();
+    private readonly AutoResetEvent _writeSignal = new(false);
+    private Thread? _writerThread;
+    private volatile bool _writerRunning;
+
     // --- Estabilidade da identidade -------------------------------------------
     // Rosto detectado não é o mesmo que pessoa confirmada. O rastreio exige
     // que a MESMA pessoa apareça por FaceConfirmSeconds antes de virar usuário
@@ -197,14 +208,100 @@ public sealed class CaptureEngine : IDisposable
         }
     }
 
-    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3, int cooldownMs = 5000)
+    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3,
+        int cooldownMs = 30_000, int backoffMs = 120_000)
     {
-        _faceRecognizer.ConfigureAutoEnrollment(minCosine, minConsecutive, cooldownMs);
+        _faceRecognizer.ConfigureAutoEnrollment(minCosine, minConsecutive, cooldownMs, backoffMs);
     }
 
     public void DisableAutoEnrollment()
     {
         _faceRecognizer.DisableAutoEnrollment();
+    }
+
+    // ------------------------------------------------- Gravação de embeddings
+
+    private void StartWriter()
+    {
+        if (_writerRunning) return;
+        _writerRunning = true;
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name = "ScreenLab.embedding-writer",
+        };
+        _writerThread.Start();
+    }
+
+    /// <summary>
+    /// Enfileira uma pose para gravação. Seguro de chamar da thread da câmera:
+    /// só faz enqueue + set de um evento.
+    /// </summary>
+    private void EnqueueEmbeddingWrite(string user, float[] embedding)
+    {
+        if (string.IsNullOrEmpty(user) || embedding is not { Length: > 0 })
+            return;
+        _pendingWrites.Enqueue((user, embedding));
+        _writeSignal.Set();
+    }
+
+    private void WriterLoop()
+    {
+        while (_writerRunning)
+        {
+            try
+            {
+                if (!_pendingWrites.TryDequeue(out var item))
+                {
+                    _writeSignal.WaitOne(500);
+                    continue;
+                }
+
+                // Consome o resto de uma vez: gravar cada pose isoladamente
+                // reescreveria o mesmo arquivo N vezes sem ganho.
+                var batch = new List<(string User, float[] Embedding)> { item };
+                while (_pendingWrites.TryDequeue(out var more))
+                    batch.Add(more);
+
+                PersistEmbeddingBatch(batch);
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Error("Falha na thread de gravação de embeddings", ex);
+            }
+        }
+    }
+
+    private void PersistEmbeddingBatch(List<(string User, float[] Embedding)> batch)
+    {
+        foreach (var (user, embedding) in batch)
+        {
+            // Memória primeiro: se a pose for duplicata ou o usuário já estiver
+            // no limite, CommitTemplate devolve false e NADA é gravado no disco.
+            // É esse desvio que evita a reescrita eterna do config.json.
+            if (!_faceRecognizer.CommitTemplate(user, embedding))
+                continue;
+
+            if (_users.AddFaceTemplate(user, embedding))
+            {
+                LoggerService.Info($"[Auto-enroll] Pose de '{user}' salva no disco (total: {_users.FaceTemplateCount(user)} poses)");
+            }
+            else
+            {
+                // Não deixa a galeria em memória divergir do config.json: se a
+                // escrita falhou, a pose não pode sobreviver ao próximo boot.
+                _faceRecognizer.RollbackTemplate(user, embedding);
+                LoggerService.Warn($"[Auto-enroll] Falha ao salvar pose de '{user}' no disco; descartada da galeria");
+            }
+        }
+    }
+
+    private void StopWriter()
+    {
+        _writerRunning = false;
+        _writeSignal.Set();
+        _writerThread?.Join(1500);
+        _writerThread = null;
     }
 
     public void LearnCurrentFace()
@@ -269,24 +366,24 @@ public sealed class CaptureEngine : IDisposable
             }
 
             string activeUser = _users.ActiveUser;
-            bool added = _faceRecognizer.AddLearningSample(activeUser, embedding);
-            if (added)
+
+            // Mesmo caminho da fila: memória e disco mudam juntos, e o
+            // CommitTemplate recusa duplicata e usuário cheio sem gravar nada.
+            if (!_faceRecognizer.CommitTemplate(activeUser, embedding))
             {
-                if (_users.AddFaceTemplate(activeUser, embedding))
-                {
-                    _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
-                    LoggerService.Info($"[LearnFace] Rosto aprendido para '{activeUser}' (total poses: {_users.FaceTemplateCount(activeUser)})");
-                    LearnFaceCompleted?.Invoke(true, $"Rosto aprendido para '{activeUser}' ({_users.FaceTemplateCount(activeUser)} poses)");
-                }
-                else
-                {
-                    _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
-                    LearnFaceCompleted?.Invoke(false, "Falha ao salvar no disco");
-                }
+                LearnFaceCompleted?.Invoke(false, "Essa pose já está na galeria (ou o usuário está no limite)");
+                return;
+            }
+
+            if (_users.AddFaceTemplate(activeUser, embedding))
+            {
+                LoggerService.Info($"[LearnFace] Rosto aprendido para '{activeUser}' (total poses: {_users.FaceTemplateCount(activeUser)})");
+                LearnFaceCompleted?.Invoke(true, $"Rosto aprendido para '{activeUser}' ({_users.FaceTemplateCount(activeUser)} poses)");
             }
             else
             {
-                LearnFaceCompleted?.Invoke(false, "Rosto muito similar a pose existente (não adicionado)");
+                _faceRecognizer.RollbackTemplate(activeUser, embedding);
+                LearnFaceCompleted?.Invoke(false, "Falha ao salvar no disco");
             }
         }
     }
@@ -368,6 +465,7 @@ public sealed class CaptureEngine : IDisposable
 
         _thread = new Thread(Loop) { IsBackground = true, Name = "ScreenLab.Capture" };
         _thread.Start();
+        StartWriter();
         LoggerService.Info("Motor de captura iniciado");
         StatusChanged?.Invoke("Iniciando câmera...");
         RunningChanged?.Invoke(true);
@@ -402,6 +500,10 @@ public sealed class CaptureEngine : IDisposable
             RunningChanged?.Invoke(false);
             return false;
         }
+
+        // Espera a fila de embeddings drenar antes de derrubar o motor: uma
+        // pose já em memória e ainda não gravada se perderia no restart.
+        StopWriter();
 
         lock (_stateLock)
         {
@@ -1188,7 +1290,9 @@ public sealed class CaptureEngine : IDisposable
         using (aligned)
         {
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
-            var match = embedding == null ? null : _faceRecognizer.RecognizeEmbedding(embedding);
+            var match = embedding == null
+                ? null
+                : _faceRecognizer.RecognizeEmbedding(embedding, EnqueueEmbeddingWrite);
             if (embedding == null)
             {
                 _lastFaceLabels[0] = "MODELO INDISPONIVEL";
@@ -1338,7 +1442,9 @@ public sealed class CaptureEngine : IDisposable
         using (aligned)
         {
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
-            var match = embedding == null ? null : _faceRecognizer.RecognizeEmbedding(embedding);
+            var match = embedding == null
+                ? null
+                : _faceRecognizer.RecognizeEmbedding(embedding, EnqueueEmbeddingWrite);
             _lastFaceLabels[labelIndex] = embedding == null
                 ? "MODELO INDISPONIVEL"
                 : match is { } result ? $"{result.Name} {result.Confidence:P0}" : "DESCONHECIDO";
@@ -1411,19 +1517,12 @@ public sealed class CaptureEngine : IDisposable
             return;
 
         _lastSampleAt = now;
-        if (_faceRecognizer.UpsertTemplate(user, embedding))
-        {
-            if (_users.AddFaceTemplate(user, embedding))
-            {
-                LoggerService.Info($"Nova pose facial adicionada para {user} ({SampleInterval.TotalSeconds:0}s de uso real)");
-            }
-            else
-            {
-                // Não deixa a galeria em memória divergir do config.json.
-                _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
-                LoggerService.Warn($"Nova pose de {user} não foi persistida e foi descartada");
-            }
-        }
+
+        // Só enfileira. A escrita (memória + disco) acontece na thread dedicada,
+        // e o CommitTemplate dela descarta duplicata e usuário cheio sem tocar
+        // no arquivo. Aqui, escrever direto reescrevia o config.json a cada
+        // SampleInterval, para sempre, mesmo com a galeria já completa.
+        EnqueueEmbeddingWrite(user, embedding);
     }
 
     private bool UpdateFaceCaptureGate(string user, DateTime now)
@@ -2049,6 +2148,7 @@ public sealed class CaptureEngine : IDisposable
             LoggerService.Warn("Recursos do motor serão liberados quando a thread encerrar.");
             return;
         }
+        _writeSignal.Dispose();
         _faceRecognizer.Dispose();
         _yunet?.Dispose();
     }

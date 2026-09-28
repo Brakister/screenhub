@@ -112,6 +112,7 @@ public class MainForm : Form
     private NumericUpDown _numAutoEnrollCosine = null!;
     private NumericUpDown _numAutoEnrollConsecutive = null!;
     private NumericUpDown _numAutoEnrollCooldown = null!;
+    private NumericUpDown _numAutoEnrollBackoff = null!;
     private CheckBox _ckAutoEnrollEnabled = null!;
 
     public MainForm(bool startMinimized) : this(startMinimized, ConfigService.ConfigPath)
@@ -818,16 +819,16 @@ public class MainForm : Form
         gb.Controls.Add(_numAutoEnrollConsecutive);
         y += 30;
 
-        AddLabel(gb, "Cooldown entre aprendizados (ms):", 12, y);
+        AddLabel(gb, "Intervalo entre poses aprendidas (s):", 12, y);
         y += 20;
         _numAutoEnrollCooldown = new NumericUpDown
         {
-            Minimum = 500,
-            Maximum = 60000,
-            Increment = 500,
+            Minimum = 5,
+            Maximum = 3600,
+            Increment = 5,
             Width = 130,
             Location = new Point(12, y),
-            Value = 5000,
+            Value = 30,
         };
         _numAutoEnrollCooldown.ValueChanged += (s, e) =>
         {
@@ -835,6 +836,25 @@ public class MainForm : Form
             ApplyAutoEnrollmentConfig();
         };
         gb.Controls.Add(_numAutoEnrollCooldown);
+        y += 30;
+
+        AddLabel(gb, "Espera ao reconhecer rosto já aprendido (s):", 12, y);
+        y += 20;
+        _numAutoEnrollBackoff = new NumericUpDown
+        {
+            Minimum = 5,
+            Maximum = 3600,
+            Increment = 15,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 120,
+        };
+        _numAutoEnrollBackoff.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            ApplyAutoEnrollmentConfig();
+        };
+        gb.Controls.Add(_numAutoEnrollBackoff);
         y += 30;
 
         var btnTestLearn = new Button
@@ -852,12 +872,13 @@ public class MainForm : Form
         var hint = new Label
         {
             Text = "Como funciona:\n" +
-                   "• Quando o sistema reconhece o usuário ativo com confiança ≥ mínima,\n" +
-                   "  incrementa um contador interno.\n" +
-                   "• Após N reconhecimentos consecutivos, adiciona automaticamente\n" +
-                   "  o embedding à galeria do usuário (melhora robustez).\n" +
-                   "• Cooldown evita adicionar poses muito similares em sequência.\n" +
-                   "• Use 'APRENDER ROSTO ATUAL (F10)' no painel lateral para forçar agora.",
+                   "• O sistema conta reconhecimentos consecutivos com confiança >= minima.\n" +
+                   "• Ao atingir N, a pose entra na galeria e e salva em disco.\n" +
+                   "• Rosto ja aprendido: nao insere nada e espera o back-off, sem\n" +
+                   "  reescrever o arquivo.\n" +
+                   "• Limite de 20 poses por usuario — ao encher, para de gravar ate\n" +
+                   "  voce refazer o cadastro. Por isso o volume de escrita e minimo.\n" +
+                   "• F10 aprende o rosto atual na hora, sem esperar as contagens.",
             AutoSize = true,
             ForeColor = Color.DimGray,
             Location = new Point(12, y),
@@ -871,12 +892,12 @@ public class MainForm : Form
 
     private void ApplyAutoEnrollmentConfig()
     {
-        if (_engine == null) return;
         float cosine = (float)_numAutoEnrollCosine.Value;
         int consecutive = (int)_numAutoEnrollConsecutive.Value;
-        int cooldown = (int)_numAutoEnrollCooldown.Value;
+        int cooldown = (int)_numAutoEnrollCooldown.Value * 1000;
+        int backoff = (int)_numAutoEnrollBackoff.Value * 1000;
         if (_ckAutoEnrollEnabled.Checked)
-            _engine.ConfigureAutoEnrollment(cosine, consecutive, cooldown);
+            _engine.ConfigureAutoEnrollment(cosine, consecutive, cooldown, backoff);
         else
             _engine.DisableAutoEnrollment();
     }
@@ -1553,7 +1574,8 @@ public class MainForm : Form
             _ckAutoEnrollEnabled.Checked = true;
             _numAutoEnrollCosine.Value = 0.55M;
             _numAutoEnrollConsecutive.Value = 3;
-            _numAutoEnrollCooldown.Value = 5000;
+            _numAutoEnrollCooldown.Value = 30;
+            _numAutoEnrollBackoff.Value = 120;
             ApplyAutoEnrollmentConfig();
 
             _cboCamera.SelectedIndex = Math.Clamp(_config.CameraIndex, 0, 9);

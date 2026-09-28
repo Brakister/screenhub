@@ -9,7 +9,7 @@
     <AssemblyName>ScreenLab</AssemblyName>
     <RootNamespace>ScreenLab</RootNamespace>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Product>ScreenLab</Product>
     <Description>Sistema leve de captura de fotos 24/7 com usuário e carimbo de data/hora</Description>
   <!-- Embalagem: um exe unico e auto-contido, com os modelos ONNX e os

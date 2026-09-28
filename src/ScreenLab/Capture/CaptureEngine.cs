@@ -51,6 +51,14 @@ public sealed class CaptureEngine : IDisposable
         "SORRIA LEVE", "FECHE OS OLHOS",
     };
     private string _lastEnrollmentPrompt = "";
+    /// <summary>
+    /// Pedido de reinício da sessão. Só a thread da.camera consome: permite
+    /// que a UI cancele/recomece sem tocar nas listas que ela não possui.
+    /// </summary>
+    private volatile bool _pendingEnrollmentReset;
+    private DateTime _enrollmentStartedAt = DateTime.MinValue;
+    /// <summary>Sem isso um cadastro travado (câmera/modelo) prendia a UI para sempre.</summary>
+    private const int EnrollmentTimeoutSeconds = 240;
 
     // --- Estabilidade da identidade -------------------------------------------
     // Rosto detectado não é o mesmo que pessoa confirmada. O rastreio exige
@@ -110,6 +118,8 @@ public sealed class CaptureEngine : IDisposable
     public event Action<string>? ErrorOccurred;
     public event Action<bool>? RunningChanged;
     public event Action<string>? FaceEnrollmentCompleted;
+    /// <summary>Cancelamento/falha/timeout: (usuário, motivo).</summary>
+    public event Action<string, string>? FaceEnrollmentCanceled;
     public event Action<string, int, int, string, int>? FaceEnrollmentProgress;
 
     public CaptureEngine(AppConfig config, UserManager users)
@@ -156,12 +166,41 @@ public sealed class CaptureEngine : IDisposable
         // a corrida que existia quando RequestFaceEnrollment os alterava aqui.
         _pendingEnrollmentUser = user;
         _pendingEnrollmentCapture = false;
+        // Recomeçar sempre do zero: sem isso, pedir o cadastro de novo para o
+        // mesmo usuário herdaria as poses da tentativa abandonada.
+        _pendingEnrollmentReset = true;
     }
 
     public void CaptureEnrollmentSample()
     {
         if (!string.IsNullOrEmpty(_pendingEnrollmentUser))
             _pendingEnrollmentCapture = true;
+    }
+
+    /// <summary>
+    /// Encerra o cadastro em andamento. Seguro para chamar da UI: libera o
+    /// botão imediatamente e manda a thread da câmera descartar as amostras.
+    /// </summary>
+    public void CancelFaceEnrollment(string reason = "Cadastro cancelado")
+    {
+        string user = _pendingEnrollmentUser;
+        _pendingEnrollmentCapture = false;
+        _pendingEnrollmentUser = "";
+        _pendingEnrollmentReset = true;
+        if (!string.IsNullOrEmpty(user))
+        {
+            LoggerService.Info($"Cadastro facial encerrado: {user} ({reason})");
+            FaceEnrollmentCanceled?.Invoke(user, reason);
+        }
+    }
+
+    private void ResetEnrollmentSession()
+    {
+        _pendingEnrollmentReset = false;
+        _enrollmentSessionUser = "";
+        _enrollmentSamples.Clear();
+        _lastEnrollmentPrompt = "";
+        _enrollmentStartedAt = DateTime.MinValue;
     }
 
     private static CascadeClassifier? LoadFaceCascade()
@@ -475,23 +514,18 @@ public sealed class CaptureEngine : IDisposable
                 {
                     _pendingManualTrigger = "";
                     bool forceFace = string.Equals(trigger, "Manual c/ Rosto", StringComparison.OrdinalIgnoreCase);
-                    LoggerService.Info($"[TRIGGER] Manual trigger: {trigger}, forceFace={forceFace}, faceReadOk={faceReadOk}, faceFrameNull={faceFrame == null}");
                     if (faceReadOk && faceFrame != null)
                     {
                         Detect(faceFrame, out _, out faceBoxes, out faceLandmarks);
                         captureFaceFrame = faceFrame;
-                        LoggerService.Info($"[TRIGGER] Detect ran, faceBoxes={faceBoxes.Length}, captureFaceFrame set");
                     }
-                    // Fallback 1: usa últimas caixas conhecidas do preview
+                    // Fallback: usa as últimas caixas conhecidas do preview.
                     if (faceBoxes.Length == 0)
-                    {
                         faceBoxes = _lastFaceBoxes;
-                        LoggerService.Info($"[TRIGGER] Fallback to _lastFaceBoxes: {faceBoxes.Length}");
-                    }
-                    // Fallback 2: se forçado mas sem frame atual, avisa
+                    // Se forçado mas sem frame atual, avisa.
                     if (forceFace && captureFaceFrame == null)
                     {
-                        LoggerService.Warn($"[TRIGGER] Forçado rosto na foto, mas câmera de rosto indisponível (faceReadOk={faceReadOk})");
+                        LoggerService.Warn("Captura forçada com rosto, mas a câmera do rosto está indisponível.");
                         StatusChanged?.Invoke("⚠ Câmera de rosto indisponível — foto sem rosto");
                     }
                     fire = true;
@@ -966,6 +1000,20 @@ public sealed class CaptureEngine : IDisposable
         _lastFaceLabels = new string[faces.Length];
         DateTime now = DateTime.Now;
 
+        // A manutenção da sessão de cadastro roda ANTES de qualquer saída
+        // antecipada. Se ficasse depois, um cadastro aberto com a pessoa longe
+        // da câmera nunca veria o timeout e a interface ficaria travada.
+        string enrollmentUser = _pendingEnrollmentUser;
+        if (_pendingEnrollmentReset)
+            ResetEnrollmentSession();
+        if (!string.IsNullOrEmpty(enrollmentUser) && _enrollmentStartedAt != DateTime.MinValue &&
+            (now - _enrollmentStartedAt).TotalSeconds > EnrollmentTimeoutSeconds)
+        {
+            CancelFaceEnrollment(
+                $"O cadastro ficou {EnrollmentTimeoutSeconds / 60} minutos sem receber poses e foi encerrado.");
+            enrollmentUser = "";
+        }
+
         if (faces.Length == 0)
         {
             ResetTrackedIdentity();
@@ -973,9 +1021,11 @@ public sealed class CaptureEngine : IDisposable
             return false;
         }
 
-        string enrollmentUser = _pendingEnrollmentUser;
         if (!string.IsNullOrEmpty(enrollmentUser))
         {
+            if (_enrollmentStartedAt == DateTime.MinValue)
+                _enrollmentStartedAt = now;
+
             ResetTrackedIdentity();
             ResetFaceDwell();
             ProcessFaceEnrollment(frame, faces, landmarks, enrollmentUser, now);
@@ -1142,12 +1192,14 @@ public sealed class CaptureEngine : IDisposable
             if (!_users.SaveFaceTemplates(user, new List<float[]>(_enrollmentSamples)))
             {
                 _lastFaceLabels[0] = "FALHA AO SALVAR CADASTRO";
+                // Sem isso a UI ficaria esperando um evento de conclusão que
+                // nunca viria, com o botão travado em "Concluindo...".
+                CancelFaceEnrollment("Não foi possível gravar o cadastro em disco.");
                 return;
             }
             _pendingEnrollmentUser = "";
             _pendingEnrollmentCapture = false;
-            _enrollmentSessionUser = "";
-            _enrollmentSamples.Clear();
+            ResetEnrollmentSession();
             _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
             _lastFaceLabels[0] = "CADASTRADO: " + user;
             FaceEnrollmentCompleted?.Invoke(user);
@@ -1717,24 +1769,22 @@ public sealed class CaptureEngine : IDisposable
         var canvas = partFrame.Clone();
         if (faceBoxes.Length != 1)
         {
-            LoggerService.Warn($"[COMPOSE] Skipping: faceBoxes.Length={faceBoxes.Length} (need exactly 1)");
+            LoggerService.Warn($"Composição ignorada: {faceBoxes.Length} caixas de rosto (é preciso exatamente 1).");
             return canvas;
         }
 
         Rect faceRect = ScaleFaceRect(faceBoxes[0], faceFrame.Width, faceFrame.Height);
-        LoggerService.Info($"[COMPOSE] faceRect={faceRect}, faceFrame={faceFrame.Width}x{faceFrame.Height}, canvas={canvas.Width}x{canvas.Height}");
-
         if (faceRect.Width <= 0 || faceRect.Height <= 0 || faceRect.X < 0 || faceRect.Y < 0 ||
             faceRect.Right > faceFrame.Width || faceRect.Bottom > faceFrame.Height)
         {
-            LoggerService.Warn($"[COMPOSE] Invalid faceRect after scaling: {faceRect}");
+            LoggerService.Warn($"Composição ignorada: caixa de rosto inválida após o escalonamento ({faceRect}).");
             return canvas;
         }
 
         using var faceCrop = new Mat(faceFrame, faceRect);
         if (faceCrop.Empty())
         {
-            LoggerService.Warn($"[COMPOSE] faceCrop is empty");
+            LoggerService.Warn("Composição ignorada: recorte do rosto saiu vazio.");
             return canvas;
         }
 
@@ -1746,37 +1796,30 @@ public sealed class CaptureEngine : IDisposable
         int width = Math.Clamp((int)Math.Round(faceCrop.Width * scale), 1, canvas.Width);
         int height = Math.Clamp((int)Math.Round(faceCrop.Height * scale), 1, canvas.Height);
 
-        LoggerService.Info($"[COMPOSE] Resizing faceCrop {faceCrop.Width}x{faceCrop.Height} to {width}x{height} (scale={scale:F2})");
-
         var outer = new Rect(
             Math.Max(0, canvas.Width - width - 20),
             20,
             width,
             height);
 
-        LoggerService.Info($"[COMPOSE] Placing at outer={outer}");
-
-        // Inner rect (inside the white border) - this is where the face goes
+        // Retângulo interno (dentro da borda branca) — é ali que o rosto é copiado.
         var inner = new Rect(outer.X + 3, outer.Y + 3,
             Math.Max(1, outer.Width - 6), Math.Max(1, outer.Height - 6));
 
-        // Resize to INNER size (not outer), since we copy to inner rect
         using var resizedFace = new Mat();
         Cv2.Resize(faceCrop, resizedFace, new Size(inner.Width, inner.Height));
 
         if (resizedFace.Size() != inner.Size)
         {
-            LoggerService.Warn($"[COMPOSE] Size mismatch after resize: resizedFace={resizedFace.Size()}, inner={inner.Size}");
+            LoggerService.Warn(
+                $"Composição ignorada: redimensionamento do rosto ficou {resizedFace.Size()} e o destino é {inner.Size}.");
             return canvas;
         }
 
         Cv2.Rectangle(canvas, outer, new Scalar(255, 255, 255), 4, LineTypes.AntiAlias);
 
         using (var destination = new Mat(canvas, inner))
-        {
             resizedFace.CopyTo(destination);
-            LoggerService.Info($"[COMPOSE] CopyTo succeeded");
-        }
 
         return canvas;
     }
@@ -1842,7 +1885,6 @@ public sealed class CaptureEngine : IDisposable
             // Para disparos forçados (tecla P), usa a maior face detectada mesmo se houver várias.
             // Para disparos automáticos de rosto, exige exatamente 1 face (confiabilidade).
             bool useFace = faceTrigger && faceFrame != null && !faceFrame.Empty() && faceBoxes.Length > 0;
-            LoggerService.Info($"[SAVE] useFace={useFace}, faceTrigger={faceTrigger}, faceFrameNull={faceFrame==null}, faceFrameEmpty={faceFrame?.Empty()}, faceBoxes={faceBoxes.Length}");
             Rect[] composeBoxes = faceBoxes;
             if (useFace && faceBoxes.Length > 1)
             {
@@ -1851,7 +1893,7 @@ public sealed class CaptureEngine : IDisposable
                 composeBoxes = new[] { largest };
             }
 
-            using var composedFrame = useFace
+            using var composedFrame = useFace && faceFrame != null
                 ? ComposeCaptureFrame(frame, faceFrame, composeBoxes)
                 : null;
             if (faceTrigger && composedFrame == null)

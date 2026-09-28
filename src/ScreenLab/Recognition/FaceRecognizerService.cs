@@ -260,13 +260,14 @@ public sealed class FaceRecognizerService : IDisposable
         if (_net != null || _loadFailed) return;
         try
         {
-            _net = CvDnn.ReadNetFromOnnx(_modelPath);
-            
+            Net net = CvDnn.ReadNetFromOnnx(_modelPath);
+            _net = net;
+
             // Detecta tipo de modelo pelo output dimension
             using var testInput = new Mat(112, 112, MatType.CV_8UC3, Scalar.All(128));
             using var blob = CvDnn.BlobFromImage(testInput, 1.0f, new OpenCvSharp.Size(112, 112), Scalar.All(0), true, false);
-            _net.SetInput(blob);
-            using var testOutput = _net.Forward();
+            net.SetInput(blob);
+            using var testOutput = net.Forward();
             int outputDim = checked((int)testOutput.Total());
 
             if (outputDim == 512)

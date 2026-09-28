@@ -971,40 +971,52 @@ public sealed class CaptureEngine : IDisposable
         if (DateTime.Now < _nextFaceCameraRetryAt)
             return false;
 
-        try
+        // Try MSMF first (Media Foundation) — better fps like Windows Camera
+        // Fall back to DSHOW if MSMF fails
+        var apis = new[] { VideoCaptureAPIs.MSMF, VideoCaptureAPIs.DSHOW };
+
+        foreach (var api in apis)
         {
-            var cap = new VideoCapture(_config.FaceCameraIndex, VideoCaptureAPIs.DSHOW);
-            if (!cap.IsOpened())
+            try
             {
-                cap.Dispose();
-                ScheduleFaceRetry();
-                LogFaceCameraUnavailable();
-                return false;
+                var cap = new VideoCapture(_config.FaceCameraIndex, api);
+                if (!cap.IsOpened())
+                {
+                    cap.Dispose();
+                    continue;
+                }
+
+                // MSMF: don't force FourCC, let it negotiate native format
+                // DSHOW: force MJPG for compatibility
+                if (api == VideoCaptureAPIs.DSHOW)
+                {
+                    cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+                }
+                cap.Set(VideoCaptureProperties.Fps, 30);
+                if (_config.FaceVideoWidth > 0)
+                    cap.Set(VideoCaptureProperties.FrameWidth, _config.FaceVideoWidth);
+                if (_config.FaceVideoHeight > 0)
+                    cap.Set(VideoCaptureProperties.FrameHeight, _config.FaceVideoHeight);
+
+                _faceCapture = cap;
+                _faceCameraFailStreak = 0;
+                _nextFaceCameraRetryAt = DateTime.MinValue;
+                LoggerService.Info(
+                    $"Câmera do rosto {_config.FaceCameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{cap.Get(VideoCaptureProperties.Fps):0}fps");
+                StatusChanged?.Invoke(
+                    $"Câmera do rosto {_config.FaceCameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
+                return true;
             }
-
-            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
-            cap.Set(VideoCaptureProperties.Fps, 30);
-            if (_config.FaceVideoWidth > 0)
-                cap.Set(VideoCaptureProperties.FrameWidth, _config.FaceVideoWidth);
-            if (_config.FaceVideoHeight > 0)
-                cap.Set(VideoCaptureProperties.FrameHeight, _config.FaceVideoHeight);
-
-            _faceCapture = cap;
-            _faceCameraFailStreak = 0;
-            _nextFaceCameraRetryAt = DateTime.MinValue;
-            LoggerService.Info(
-                $"Câmera do rosto {_config.FaceCameraIndex} aberta em {cap.FrameWidth}x{cap.FrameHeight}");
-            StatusChanged?.Invoke(
-                $"Câmera do rosto {_config.FaceCameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
-            return true;
+            catch (Exception ex)
+            {
+                LoggerService.Warn($"Falha ao abrir câmera do rosto {_config.FaceCameraIndex} via {api}: {ex.Message}");
+                // Try next API
+            }
         }
-        catch (Exception ex)
-        {
-            ScheduleFaceRetry();
-            LoggerService.Error($"Falha ao abrir câmera do rosto {_config.FaceCameraIndex}", ex);
-            LogFaceCameraUnavailable();
-            return false;
-        }
+
+        ScheduleFaceRetry();
+        LogFaceCameraUnavailable();
+        return false;
     }
 
     /// <summary>Backoff progressivo: tenta logo no início, depois espaça para

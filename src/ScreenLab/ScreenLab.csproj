@@ -12,6 +12,18 @@
     <Version>1.2.0</Version>
     <Product>ScreenLab</Product>
     <Description>Sistema leve de captura de fotos 24/7 com usuário e carimbo de data/hora</Description>
+  <!-- Embalagem: um exe unico e auto-contido, com os modelos ONNX e os
+         haarcascades embutidos DENTRO do exe. Sem isso, quem baixa so o
+         .exe do release nao tem a pasta Data/ ao lado e a deteccao (os
+         quadradinhos) nao funciona. IncludeAllContentForSelfExtract embute
+         o conteudo e o AppContext.BaseDirectory passa a apontar para a
+         pasta onde ele e extraido na hora de rodar. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
   <ItemGroup>

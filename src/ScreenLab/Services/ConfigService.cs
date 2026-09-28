@@ -21,6 +21,12 @@ public class AppConfig
 
     public int CameraIndex { get; set; } = 0;
     public int FaceCameraIndex { get; set; } = 1;
+    /// <summary>
+    /// Liga a janela (e a captura) da câmera do rosto. -1 em FaceCameraIndex
+    /// significa "sem câmera de rosto". Com uma câmera só, o layout mostra
+    /// apenas a câmera da peça.
+    /// </summary>
+    public bool FaceCameraEnabled { get; set; } = true;
     public int VideoWidth { get; set; } = 1920;
     public int VideoHeight { get; set; } = 1080;
     public int FaceVideoWidth { get; set; } = 1280;
@@ -229,7 +235,7 @@ public static class ConfigService
         }
 
         changed |= ClampProperty(() => cfg.CameraIndex, value => cfg.CameraIndex = value, 0, 9);
-        changed |= ClampProperty(() => cfg.FaceCameraIndex, value => cfg.FaceCameraIndex = value, 0, 9);
+        changed |= ClampProperty(() => cfg.FaceCameraIndex, value => cfg.FaceCameraIndex = value, -1, 9);
         changed |= ClampProperty(() => cfg.VideoWidth, value => cfg.VideoWidth = value, 320, 7680);
         changed |= ClampProperty(() => cfg.VideoHeight, value => cfg.VideoHeight = value, 240, 4320);
         changed |= ClampProperty(() => cfg.FaceVideoWidth, value => cfg.FaceVideoWidth = value, 320, 1920);

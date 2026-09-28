@@ -28,8 +28,8 @@ public sealed class CaptureEngine : IDisposable
     private const int PreviewHeight = 450;
     private const int FacePreviewWidth = 640;
     private const int FacePreviewHeight = 480;
-    private const int PreviewMinIntervalMs = 45; // ~22 fps
-    private const int LoopPauseMsWithPreview = 10;
+    private const int PreviewMinIntervalMs = 33; // ~30 fps no preview da peça
+    private const int LoopTargetMsWithPreview = 30; // ~33ms/frame → máx ~30 fps
     private const int LoopPauseMsWithoutPreview = 90; // oculto: ~10 leituras/s p/ economizar CPU
 
     private readonly AppConfig _config;
@@ -108,6 +108,13 @@ public sealed class CaptureEngine : IDisposable
     private Thread? _thread;
     private CancellationTokenSource? _cts;
     private int _disposed;
+
+    /// <summary>
+    /// Janela (e captura) da câmera do rosto. Desligar para economizar CPU e
+    /// silenciar o log quando o PC só tem uma câmera.
+    /// </summary>
+    private volatile bool _faceCameraEnabled = true;
+    private int _faceCameraFailStreak;
 
     private readonly Stopwatch _faceWatch = Stopwatch.StartNew();
     private readonly Stopwatch _previewWatch = Stopwatch.StartNew();
@@ -361,6 +368,7 @@ public sealed class CaptureEngine : IDisposable
     }
 
     private volatile bool _pendingLearnFace = false;
+    private int _learnFaceMisses;
 
     private void ProcessLearnCurrentFace(Mat faceFrame)
     {
@@ -622,6 +630,29 @@ public sealed class CaptureEngine : IDisposable
     }
 
     /// <summary>
+    /// Liga/desliga a captura da câmera do rosto (janela + reconhecimento).
+    /// Ao desligar, libera a câmera imediatamente; ao ligar, o loop reabre no
+    /// próximo ciclo sem reiniciar a thread.
+    /// </summary>
+    public void SetFaceCameraEnabled(bool enabled)
+    {
+        if (_faceCameraEnabled == enabled)
+            return;
+        _faceCameraEnabled = enabled;
+        lock (_stateLock)
+        {
+            if (!enabled)
+            {
+                _faceCapture?.Dispose();
+                _faceCapture = null;
+            }
+            _nextFaceCameraRetryAt = DateTime.MinValue;
+        }
+        LoggerService.Info(enabled ? "Câmera do rosto ligada" : "Câmera do rosto desligada");
+        StatusChanged?.Invoke(enabled ? "Câmera do rosto: ligada" : "Câmera do rosto: desligada");
+    }
+
+    /// <summary>
     /// Invalida confirmação e dwell quando a escolha manual do usuário muda.
     /// O cooldown por pessoa é preservado entre mudanças e reinícios do motor.
     /// </summary>
@@ -678,11 +709,40 @@ public sealed class CaptureEngine : IDisposable
 
     public void ResetIntervalTimer() => _lastIntervalCapture = DateTime.Now;
 
+    /// <summary>Índice e descrição de uma câmera encontrada no sistema.</summary>
+    public readonly record struct CameraInfo(int Index, string Description);
+
+    /// <summary>
+    /// Varre as câmeras DSHOW de 0..maxIndex e devolve as disponíveis com a
+    /// resolução. Custa abrir cada câmera uma vez: chame antes de iniciar a
+    /// captura ou no botão "Re-scanear câmeras".
+    /// </summary>
+    public static List<CameraInfo> FindAvailableCameras(int maxIndex = 9)
+    {
+        var found = new List<CameraInfo>();
+        for (int i = 0; i <= maxIndex; i++)
+        {
+            try
+            {
+                using var cap = new VideoCapture(i, VideoCaptureAPIs.DSHOW);
+                if (!cap.IsOpened())
+                    continue;
+                found.Add(new CameraInfo(i,
+                    $"{cap.FrameWidth}x{cap.FrameHeight} ({cap.Get(VideoCaptureProperties.Fps):0} fps)"));
+            }
+            catch
+            {
+                // Índice sem câmera: segue para o próximo.
+            }
+        }
+        return found;
+    }
+
     public static bool CameraAvailable(int index)
     {
         try
         {
-            using var cap = new VideoCapture(index);
+            using var cap = new VideoCapture(index, VideoCaptureAPIs.DSHOW);
             return cap.IsOpened();
         }
         catch
@@ -695,7 +755,7 @@ public sealed class CaptureEngine : IDisposable
     {
         try
         {
-            using var cap = new VideoCapture(index);
+            using var cap = new VideoCapture(index, VideoCaptureAPIs.DSHOW);
             if (!cap.IsOpened()) return "indisponível";
             return $"{cap.FrameWidth}x{cap.FrameHeight} ({cap.Get(VideoCaptureProperties.Fps):0} fps)";
         }
@@ -703,6 +763,81 @@ public sealed class CaptureEngine : IDisposable
         {
             return "indisponível";
         }
+    }
+
+    /// <summary>Resultado da medição de um modo de captura.</summary>
+    public sealed class CaptureModeProbe
+    {
+        public CaptureModeProbe(int width, int height, double avgReadMs)
+        {
+            Width = width;
+            Height = height;
+            AvgReadMs = avgReadMs;
+        }
+
+        public int Width { get; }
+
+        public int Height { get; }
+
+        public double AvgReadMs { get; }
+    }
+
+    /// <summary>
+    /// Auto-teste: abre a câmera no modo pedido e mede o tempo médio de
+    /// leitura de quadro. Com isso dá para saber se a câmera sustenta 1080p
+    /// fluido ou se só aguenta 640x480 (~24 fps), como muita câmera USB barata.
+    /// </summary>
+    public static CaptureModeProbe? MeasureCaptureMode(int index, int width, int height)
+    {
+        try
+        {
+            using var cap = new VideoCapture(index, VideoCaptureAPIs.DSHOW);
+            if (!cap.IsOpened()) return null;
+            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+            cap.Set(VideoCaptureProperties.FrameWidth, width);
+            cap.Set(VideoCaptureProperties.FrameHeight, height);
+
+            // Aquece e descarta buffering do driver antes de medir.
+            using var warm = new Mat();
+            var wsw = Stopwatch.StartNew();
+            while (wsw.ElapsedMilliseconds < 400 && cap.Read(warm)) { }
+
+            double sum = 0;
+            int n = 0;
+            using var f = new Mat();
+            for (int i = 0; i < 3; i++)
+            {
+                var sw = Stopwatch.StartNew();
+                if (cap.Read(f) && !f.Empty())
+                {
+                    sum += sw.Elapsed.TotalMilliseconds;
+                    n++;
+                }
+            }
+            return new CaptureModeProbe(cap.FrameWidth, cap.FrameHeight,
+                n > 0 ? sum / n : double.MaxValue);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Acha a maior resolução que a câmera entrega com fluidez (leitura média
+    /// ≤ ~55ms ≈ 18fps). Evita configurar 1920x1080 numa câmera que só sustenta
+    /// 640x480@24 e deixar o preview travado em ~2fps.
+    /// </summary>
+    public static (int Width, int Height) FindFastCaptureSize(int index)
+    {
+        var candidates = new[] { (1920, 1080), (1280, 720), (960, 540), (800, 600), (640, 480) };
+        foreach (var (w, h) in candidates)
+        {
+            var p = MeasureCaptureMode(index, w, h);
+            if (p != null && p.AvgReadMs <= 55)
+                return (p.Width, p.Height);
+        }
+        return (640, 480);
     }
 
     private void Loop()
@@ -729,6 +864,7 @@ public sealed class CaptureEngine : IDisposable
 
                 var frame = FrameBuffer;
                 var swRead = Stopwatch.StartNew();
+                var swIter = Stopwatch.StartNew();
                 bool readOk = capture.Read(frame) && !frame.Empty();
 
                 if (!readOk)
@@ -742,25 +878,26 @@ public sealed class CaptureEngine : IDisposable
 
                 bool faceReadOk = false;
                 Mat? faceFrame = null;
-                if (EnsureFaceCameraOpen())
+                bool faceCamOpen = EnsureFaceCameraOpen();
+                // A câmera do rosto NÃO é lida em todo frame: só quando a
+                // detecção/reconhecimento está na hora (FaceIntervalMs), num
+                // disparo manual (F9/F10) ou numa foto de intervalo. Ler as
+                // duas câmeras em sequência (bloqueante) e ainda dormir por
+                // cima é o que derruba o preview da peça para ~5 fps.
+                bool faceDueNow = _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs;
+                bool intervalDueNow = _config.IntervalEnabled &&
+                    (DateTime.Now - _lastIntervalCapture).TotalSeconds >= _config.IntervalSeconds;
+                bool needFaceNow = _pendingLearnFace || _pendingManualTrigger != "" || faceDueNow || intervalDueNow;
+                if (faceCamOpen && needFaceNow)
                 {
-                    if (_config.FaceCameraIndex == _config.CameraIndex)
+                    var faceCapture = _faceCapture;
+                    if (faceCapture != null)
                     {
-                        frame.CopyTo(FaceFrameBuffer);
-                        faceFrame = FaceFrameBuffer;
-                        faceReadOk = !faceFrame.Empty();
-                    }
-                    else
-                    {
-                        var faceCapture = _faceCapture;
-                        if (faceCapture != null)
-                        {
-                            faceReadOk = faceCapture.Read(FaceFrameBuffer) && !FaceFrameBuffer.Empty();
-                            if (faceReadOk)
-                                faceFrame = FaceFrameBuffer;
-                            else
-                                TryDisposeFaceCapture();
-                        }
+                        faceReadOk = faceCapture.Read(FaceFrameBuffer) && !FaceFrameBuffer.Empty();
+                        if (faceReadOk)
+                            faceFrame = FaceFrameBuffer;
+                        else
+                            TryDisposeFaceCapture();
                     }
                 }
                 swRead.Stop();
@@ -768,13 +905,20 @@ public sealed class CaptureEngine : IDisposable
 
                 if (_pendingLearnFace)
                 {
-                    _pendingLearnFace = false;
+                    // O primeiro ciclo pode não ter lido o rosto ainda (leitura
+                    // intervalada). Tenta alguns ciclos antes de reportar falha;
+                    // isso evita um aviso falso no instante em que o F10 foi
+                    // pressionado fora do ciclo de leitura do rosto.
                     if (faceReadOk && faceFrame != null)
                     {
+                        _pendingLearnFace = false;
+                        _learnFaceMisses = 0;
                         ProcessLearnCurrentFace(faceFrame);
                     }
-                    else
+                    else if (++_learnFaceMisses >= 5)
                     {
+                        _pendingLearnFace = false;
+                        _learnFaceMisses = 0;
                         LearnFaceCompleted?.Invoke(false, "Câmera de rosto indisponível");
                     }
                 }
@@ -822,31 +966,28 @@ public sealed class CaptureEngine : IDisposable
                     trigger = "Intervalo";
                     fire = true;
                 }
-                // Sem câmera de rosto: só processa reconhecimento no frame principal
-                else if (!faceReadOk)
+                // Sem câmera de rosto dedicada: roda reconhecimento no frame
+                // principal, mas com o mesmo intervalo (senão custa CPU à toa).
+                else if (!faceCamOpen && _faceCameraEnabled && _config.FaceCameraIndex >= 0)
                 {
                     faceBoxes = Array.Empty<Rect>();
                     faceLandmarks = Array.Empty<Point2f[]>();
-                    ProcessFaceRecognition(frame, faceBoxes, faceLandmarks);
+                    if (_faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs)
+                    {
+                        _faceWatch.Restart();
+                        ProcessFaceRecognition(frame, faceBoxes, faceLandmarks);
+                    }
                 }
 
-                // Atualiza caixas de rosto para a pré-visualização (independente de gatilhos).
-                // Roda a detecção no intervalo configurado para manter os quadrados verdes atualizados.
-                if (faceReadOk && faceFrame != null && _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs)
+                // Prévia do rosto: só re-envia quando há frame novo (imagem +
+                // quadrados) — _lastFaceBoxes já foi atualizado pelo Detect acima.
+                if (faceReadOk && faceFrame != null)
                 {
-                    _faceWatch.Restart();
-                    Detect(faceFrame, out _, out var previewBoxes, out var previewLandmarks);
-                    _lastFaceBoxes = previewBoxes;
-                    _lastFaceLandmarks = previewLandmarks;
-                    _lastFaceLabels = new string[previewBoxes.Length];
-                    for (int i = 0; i < previewBoxes.Length; i++)
-                        _lastFaceLabels[i] = "RECONHECENDO";
-                }
-                else
-                {
-                    // Mantém as caixas do ciclo anterior se a detecção não rodou
-                    _lastFaceBoxes = faceBoxes;
-                    _lastFaceLandmarks = faceLandmarks;
+                    Cv2.Resize(faceFrame, FacePreviewBuffer,
+                        new Size(FacePreviewWidth, FacePreviewHeight));
+                    DrawFaceOverlay(FacePreviewBuffer, _lastFaceBoxes, _lastFaceLabels,
+                        FacePreviewWidth, FacePreviewHeight);
+                    FacePreviewFrame?.Invoke(FacePreviewBuffer);
                 }
                 swDetect.Stop();
                 Accumulate(ref _detectMs, swDetect.ElapsedMilliseconds);
@@ -867,15 +1008,20 @@ public sealed class CaptureEngine : IDisposable
                     _previewWatch.Restart();
                     Cv2.Resize(frame, PreviewBuffer, new Size(PreviewWidth, PreviewHeight));
                     PreviewFrame?.Invoke(PreviewBuffer);
+                }
 
-                    if (faceFrame != null && !faceFrame.Empty())
-                    {
-                        Cv2.Resize(faceFrame, FacePreviewBuffer,
-                            new Size(FacePreviewWidth, FacePreviewHeight));
-                        DrawFaceOverlay(FacePreviewBuffer, _lastFaceBoxes, _lastFaceLabels,
-                            FacePreviewWidth, FacePreviewHeight);
-                        FacePreviewFrame?.Invoke(FacePreviewBuffer);
-                    }
+                // Marcador de ritmo: com preview aberto, a própria leitura da
+                // câmera impõe o ritmo (~30 fps) — não dorme nada por cima.
+                // O sleep só completa o tempo que falta se a câmera for rápida.
+                if (_previewWanted)
+                {
+                    long itMs = swIter.ElapsedMilliseconds;
+                    if (itMs < LoopTargetMsWithPreview)
+                        Thread.Sleep((int)(LoopTargetMsWithPreview - itMs));
+                }
+                else
+                {
+                    Thread.Sleep(LoopPauseMsWithoutPreview);
                 }
             }
             catch (Exception ex)
@@ -884,8 +1030,6 @@ public sealed class CaptureEngine : IDisposable
                 ErrorOccurred?.Invoke(ex.Message);
                 Thread.Sleep(1000);
             }
-
-            Thread.Sleep(_previewWanted ? LoopPauseMsWithPreview : LoopPauseMsWithoutPreview);
         }
     }
 
@@ -933,8 +1077,15 @@ public sealed class CaptureEngine : IDisposable
 
     private bool EnsureFaceCameraOpen()
     {
+        // Janela do rosto desligada pelo usuário, ou nenhuma câmera de rosto
+        // escolhida (índice -1): não tenta abrir nada — economiza CPU e evita
+        // log de erro a cada 2 s.
+        if (!_faceCameraEnabled || _config.FaceCameraIndex < 0)
+            return false;
+        // Mesmo índice da principal: não existe câmera de rosto separada. A UI
+        // esconde a janela (layout modular) e o reconhecimento fica desligado.
         if (_config.FaceCameraIndex == _config.CameraIndex)
-            return _capture?.IsOpened() == true;
+            return false;
 
         var capture = _faceCapture;
         if (capture != null && capture.IsOpened())
@@ -948,7 +1099,7 @@ public sealed class CaptureEngine : IDisposable
             if (!cap.IsOpened())
             {
                 cap.Dispose();
-                _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(2);
+                ScheduleFaceRetry();
                 LogFaceCameraUnavailable();
                 return false;
             }
@@ -960,6 +1111,7 @@ public sealed class CaptureEngine : IDisposable
                 cap.Set(VideoCaptureProperties.FrameHeight, _config.FaceVideoHeight);
 
             _faceCapture = cap;
+            _faceCameraFailStreak = 0;
             _nextFaceCameraRetryAt = DateTime.MinValue;
             LoggerService.Info(
                 $"Câmera do rosto {_config.FaceCameraIndex} aberta em {cap.FrameWidth}x{cap.FrameHeight}");
@@ -969,11 +1121,20 @@ public sealed class CaptureEngine : IDisposable
         }
         catch (Exception ex)
         {
-            _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(2);
+            ScheduleFaceRetry();
             LoggerService.Error($"Falha ao abrir câmera do rosto {_config.FaceCameraIndex}", ex);
             LogFaceCameraUnavailable();
             return false;
         }
+    }
+
+    /// <summary>Backoff progressivo: tenta logo no início, depois espaça para
+    /// não ficar "se perguntando" pela câmera que não está ligada.</summary>
+    private void ScheduleFaceRetry()
+    {
+        int delay = _faceCameraFailStreak < 3 ? 2 : _faceCameraFailStreak < 8 ? 10 : 60;
+        _faceCameraFailStreak++;
+        _nextFaceCameraRetryAt = DateTime.Now.AddSeconds(delay);
     }
 
     private void LogFaceCameraUnavailable()
@@ -982,7 +1143,7 @@ public sealed class CaptureEngine : IDisposable
             return;
         _lastFaceCameraFailLog = DateTime.Now;
         LoggerService.Warn(
-            $"Câmera do rosto {_config.FaceCameraIndex} indisponível — tentando novamente a cada 2 s");
+            $"Câmera do rosto {_config.FaceCameraIndex} indisponível — tentando novamente");
         StatusChanged?.Invoke(
             $"Câmera do rosto {_config.FaceCameraIndex} indisponível; foto da peça continua normalmente");
     }

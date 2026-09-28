@@ -57,6 +57,16 @@ public class MainForm : Form
     // Pré-visualização
     private PictureBox _preview = null!;
     private PictureBox _facePreview = null!;
+    private TableLayoutPanel _previewGrid = null!;
+    private Panel _objectCameraPanel = null!;
+    private Panel _faceCameraPanel = null!;
+    private Label _faceCameraLabel = null!;
+    private Button _btnToggleFaceWindow = null!;
+    private Button _btnRescanCameras = null!;
+    private readonly List<int> _cameraOptions = new();
+    private readonly List<int> _faceCameraOptions = new();
+    private readonly List<int> _availableCameras = new();
+    private bool _faceCameraAvailable;
     private ToolStripStatusLabel _lblStatus = null!;
     private ToolStripStatusLabel _lblLast = null!;
     private StatusStrip _statusStrip = null!;
@@ -199,7 +209,7 @@ public class MainForm : Form
             BackColor = Color.Black,
         };
 
-        var previewGrid = new TableLayoutPanel
+        _previewGrid = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
@@ -207,10 +217,10 @@ public class MainForm : Form
             BackColor = Color.Black,
             Padding = new Padding(4),
         };
-        previewGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-        previewGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        _previewGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70f));
+        _previewGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30f));
 
-        var objectCameraPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(2) };
+        _objectCameraPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(2) };
         var objectCameraLabel = new Label
         {
             Text = "CÂMERA DA PEÇA",
@@ -220,11 +230,11 @@ public class MainForm : Form
             BackColor = Color.FromArgb(35, 35, 35),
             TextAlign = ContentAlignment.MiddleCenter,
         };
-        objectCameraPanel.Controls.Add(_preview);
-        objectCameraPanel.Controls.Add(objectCameraLabel);
+        _objectCameraPanel.Controls.Add(_preview);
+        _objectCameraPanel.Controls.Add(objectCameraLabel);
 
-        var faceCameraPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(2) };
-        var faceCameraLabel = new Label
+        _faceCameraPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black, Padding = new Padding(2) };
+        _faceCameraLabel = new Label
         {
             Text = "CÂMERA DO ROSTO",
             Dock = DockStyle.Top,
@@ -233,12 +243,15 @@ public class MainForm : Form
             BackColor = Color.FromArgb(35, 35, 35),
             TextAlign = ContentAlignment.MiddleCenter,
         };
-        faceCameraPanel.Controls.Add(_facePreview);
-        faceCameraPanel.Controls.Add(faceCameraLabel);
-        previewGrid.Controls.Add(objectCameraPanel, 0, 0);
-        previewGrid.Controls.Add(faceCameraPanel, 1, 0);
-        mid.Controls.Add(previewGrid);
-        previewGrid.BringToFront();
+        // Clique no título alterna a janela — atalho prático ao lado da UI.
+        _faceCameraLabel.Cursor = Cursors.Hand;
+        _faceCameraLabel.Click += (s, e) => SetFaceWindowEnabled(!_config.FaceCameraEnabled);
+        _faceCameraPanel.Controls.Add(_facePreview);
+        _faceCameraPanel.Controls.Add(_faceCameraLabel);
+        _previewGrid.Controls.Add(_objectCameraPanel, 0, 0);
+        _previewGrid.Controls.Add(_faceCameraPanel, 1, 0);
+        mid.Controls.Add(_previewGrid);
+        _previewGrid.BringToFront();
 
         // Contagem regressiva de 1 s (sobreposto à pré-visualização)
         _lblCountdown = new Label
@@ -1086,16 +1099,18 @@ public class MainForm : Form
             Width = 200,
             Location = new Point(12, y),
         };
-        for (int i = 0; i < 10; i++) _cboCamera.Items.Add($"Câmera {i}");
         _cboCamera.SelectedIndexChanged += (s, e) =>
         {
             if (_loadingUi || _cboCamera.SelectedIndex < 0) return;
-            if (_config.CameraIndex != _cboCamera.SelectedIndex)
-            {
-                _config.CameraIndex = _cboCamera.SelectedIndex;
-                SaveConfig();
-                _engine.SetCameraIndices(_config.CameraIndex, _config.FaceCameraIndex);
-            }
+            if (_cboCamera.SelectedIndex >= _cameraOptions.Count) return;
+            int cam = _cameraOptions[_cboCamera.SelectedIndex];
+            if (cam == _config.CameraIndex) return;
+            _config.CameraIndex = cam;
+            SaveConfig();
+            _engine.SetCameraIndices(cam, _config.FaceCameraIndex);
+            RefreshFaceOptionAvailability();
+            ApplyCameraLayout();
+            _lblStatus.Text = $"Câmera principal: {cam}";
         };
 
         _btnTestCamera = new Button
@@ -1121,16 +1136,20 @@ public class MainForm : Form
             Width = 200,
             Location = new Point(12, y),
         };
-        for (int i = 0; i < 10; i++) _cboFaceCamera.Items.Add($"Câmera {i}");
         _cboFaceCamera.SelectedIndexChanged += (s, e) =>
         {
             if (_loadingUi || _cboFaceCamera.SelectedIndex < 0) return;
-            if (_config.FaceCameraIndex != _cboFaceCamera.SelectedIndex)
-            {
-                _config.FaceCameraIndex = _cboFaceCamera.SelectedIndex;
-                SaveConfig();
-                _engine.SetCameraIndices(_config.CameraIndex, _config.FaceCameraIndex);
-            }
+            if (_cboFaceCamera.SelectedIndex >= _faceCameraOptions.Count) return;
+            int cam = _faceCameraOptions[_cboFaceCamera.SelectedIndex];
+            if (cam == _config.FaceCameraIndex) return;
+            _config.FaceCameraIndex = cam;
+            SaveConfig();
+            _engine.SetCameraIndices(_config.CameraIndex, cam);
+            RefreshFaceOptionAvailability();
+            ApplyCameraLayout();
+            _lblStatus.Text = cam < 0
+                ? "Câmera do rosto: nenhuma"
+                : $"Câmera do rosto: {cam}";
         };
 
         _btnTestFaceCamera = new Button
@@ -1144,6 +1163,46 @@ public class MainForm : Form
         _btnTestFaceCamera.Click += (s, e) => TestFaceCamera();
         gb.Controls.Add(_cboFaceCamera);
         gb.Controls.Add(_btnTestFaceCamera);
+        y += 34;
+
+        AddLabel(gb, "Janela da câmera do rosto:", 12, y);
+        y += 20;
+        _btnToggleFaceWindow = new Button
+        {
+            Text = "JANELA DO ROSTO",
+            Width = 200,
+            Height = 25,
+            FlatStyle = FlatStyle.System,
+            Location = new Point(12, y),
+        };
+        _btnToggleFaceWindow.Click += (s, e) => SetFaceWindowEnabled(!_config.FaceCameraEnabled);
+        gb.Controls.Add(_btnToggleFaceWindow);
+        y += 30;
+
+        _btnRescanCameras = new Button
+        {
+            Text = "Re-scanear câmeras",
+            Width = 200,
+            Height = 25,
+            FlatStyle = FlatStyle.System,
+            Location = new Point(12, y),
+        };
+        _btnRescanCameras.Click += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _loadingUi = true;
+            try
+            {
+                RefreshCameraCombos();
+                ApplyCameraLayout();
+                _lblStatus.Text = "Câmeras re-escaneadas";
+            }
+            finally
+            {
+                _loadingUi = false;
+            }
+        };
+        gb.Controls.Add(_btnRescanCameras);
         y += 34;
 
         AddLabel(gb, "Resolução câmera da peça (WxH):", 12, y);
@@ -1546,8 +1605,16 @@ public class MainForm : Form
 
     private void TestCamera()
     {
-        int index = _cboCamera.SelectedIndex;
+        int index = _cboCamera.SelectedIndex >= 0 && _cboCamera.SelectedIndex < _cameraOptions.Count
+            ? _cameraOptions[_cboCamera.SelectedIndex]
+            : -1;
         _btnTestCamera.Enabled = false;
+        if (index < 0)
+        {
+            _lblStatus.Text = "Nenhuma câmera disponível para testar.";
+            _btnTestCamera.Enabled = true;
+            return;
+        }
         _lblStatus.Text = $"Testando câmera {index}...";
         try
         {
@@ -1572,11 +1639,17 @@ public class MainForm : Form
 
     private void TestFaceCamera()
     {
-        int index = _cboFaceCamera.SelectedIndex;
+        int index = _cboFaceCamera.SelectedIndex >= 0 && _cboFaceCamera.SelectedIndex < _faceCameraOptions.Count
+            ? _faceCameraOptions[_cboFaceCamera.SelectedIndex]
+            : -1;
         _btnTestFaceCamera.Enabled = false;
-        _lblStatus.Text = $"Testando câmera do rosto {index}...";
         try
         {
+            if (index < 0)
+            {
+                _lblStatus.Text = "Sem câmera de rosto selecionada.";
+                return;
+            }
             string info = CaptureEngine.DescribeCamera(index);
             bool ok = CaptureEngine.CameraAvailable(index);
             _lblStatus.Text = ok && info != "indisponível"
@@ -1774,8 +1847,10 @@ public class MainForm : Form
             _numMinMargin.Value = (decimal)Math.Round(_engine.RecognitionMargin, 3);
             ApplyAutoEnrollmentConfig();
 
-            _cboCamera.SelectedIndex = Math.Clamp(_config.CameraIndex, 0, 9);
-            _cboFaceCamera.SelectedIndex = Math.Clamp(_config.FaceCameraIndex, 0, 9);
+            _cboCamera.SelectedIndex = -1;
+            _cboFaceCamera.SelectedIndex = -1;
+            RefreshCameraCombos();
+            _engine.SetFaceCameraEnabled(_config.FaceCameraEnabled);
 
             _numVideoWidth.Value = Math.Clamp(_config.VideoWidth, 640, 3840);
             _numVideoHeight.Value = Math.Clamp(_config.VideoHeight, 480, 2160);
@@ -1799,6 +1874,95 @@ public class MainForm : Form
 
         // Fora do guard: a medicao e O(n2) e so serve para informar a UI.
         RefreshGalleryDiagnostics();
+        SyncFaceToggleUi();
+        ApplyCameraLayout();
+        AutoTuneCameras();
+    }
+
+    /// <summary>
+    /// Auto-teste de câmeras no startup (antes do motor iniciar):
+    /// 1) se só existe 1 câmera, desliga a câmera do rosto automaticamente — não
+    ///    fica "se perguntando" onde está a outra;
+    /// 2) mede o fps real do modo de captura configurado e, se estiver lento,
+    ///    escolhe sozinho a maior resolução que a câmera aguenta fluida.
+    /// O resultado vai para o log e para a barra de status.
+    /// </summary>
+    private void AutoTuneCameras()
+    {
+        var summary = new List<string>();
+
+        // (1) Só uma câmera no sistema e a de rosto configurada não existe.
+        if (_config.FaceCameraEnabled && _config.FaceCameraIndex >= 0 &&
+            _availableCameras.Count == 1 && !_availableCameras.Contains(_config.FaceCameraIndex))
+        {
+            LoggerService.Info("Auto-teste: só 1 câmera detectada — câmera do rosto desativada.");
+            _config.FaceCameraIndex = -1;
+            SaveConfig();
+            summary.Add("só 1 câmera; rosto desligado");
+            _loadingUi = true;
+            RefreshCameraCombos();
+            ApplyCameraLayout();
+            _loadingUi = false;
+        }
+
+        // (2) Resolução da câmera principal: mede o modo atual; se lento, troca.
+        var current = CaptureEngine.MeasureCaptureMode(_config.CameraIndex, _config.VideoWidth, _config.VideoHeight);
+        if (current != null && current.AvgReadMs > 55)
+        {
+            var best = CaptureEngine.FindFastCaptureSize(_config.CameraIndex);
+            if (best.Width != _config.VideoWidth || best.Height != _config.VideoHeight)
+            {
+                LoggerService.Info(
+                    $"Auto-teste: câmera {_config.CameraIndex} está lenta em " +
+                    $"{_config.VideoWidth}x{_config.VideoHeight} ({current.AvgReadMs:0}ms/frame ≈ " +
+                    $"{1000.0 / current.AvgReadMs:0}fps) — usando {best.Width}x{best.Height}.");
+                _config.VideoWidth = best.Width;
+                _config.VideoHeight = best.Height;
+                SaveConfig();
+                summary.Add($"resolução → {best.Width}x{best.Height}");
+                _loadingUi = true;
+                _numVideoWidth.Value = Math.Clamp(best.Width, 640, 3840);
+                _numVideoHeight.Value = Math.Clamp(best.Height, 480, 2160);
+                _loadingUi = false;
+            }
+            else
+            {
+                // Mesmo modo lento sem alternativa — avisa no log.
+                LoggerService.Warn(
+                    $"Auto-teste: câmera {_config.CameraIndex} lenta mesmo no menor modo " +
+                    $"({current.Width}x{current.Height}, {current.AvgReadMs:0}ms/frame ≈ {1000.0 / current.AvgReadMs:0}fps).");
+                summary.Add("câmera lenta em qualquer resolução");
+            }
+        }
+
+        // (3) Câmera do rosto presente? Mede a resolução dela também.
+        if (_config.FaceCameraIndex >= 0 && _config.FaceCameraIndex != _config.CameraIndex &&
+            _availableCameras.Contains(_config.FaceCameraIndex))
+        {
+            var fc = CaptureEngine.MeasureCaptureMode(_config.FaceCameraIndex, _config.FaceVideoWidth, _config.FaceVideoHeight);
+            if (fc != null && fc.AvgReadMs > 55)
+            {
+                var bestFace = CaptureEngine.FindFastCaptureSize(_config.FaceCameraIndex);
+                if (bestFace.Width != _config.FaceVideoWidth || bestFace.Height != _config.FaceVideoHeight)
+                {
+                    LoggerService.Info(
+                        $"Auto-teste: câmera do rosto {_config.FaceCameraIndex} lenta em " +
+                        $"{_config.FaceVideoWidth}x{_config.FaceVideoHeight} — usando {bestFace.Width}x{bestFace.Height}.");
+                    _config.FaceVideoWidth = bestFace.Width;
+                    _config.FaceVideoHeight = bestFace.Height;
+                    SaveConfig();
+                    summary.Add($"rosto → {bestFace.Width}x{bestFace.Height}");
+                    _loadingUi = true;
+                    _numFaceVideoWidth.Value = Math.Clamp(bestFace.Width, 320, 1920);
+                    _numFaceVideoHeight.Value = Math.Clamp(bestFace.Height, 240, 1080);
+                    _loadingUi = false;
+                }
+            }
+        }
+
+        foreach (var cam in _availableCameras)
+            summary.Add($"Câmera {cam} disponível");
+        _lblStatus.Text = "Auto-teste: " + string.Join(" • ", summary);
     }
 
     private void ReloadUserCombo()
@@ -1829,6 +1993,135 @@ public class MainForm : Form
     }
 
     private void SaveConfig() => ConfigService.Save(_config);
+
+    /// <summary>
+    /// Liga/desliga a janela da câmera do rosto. Persiste na configuração,
+    /// avisa o motor (para liberar a câmera) e reorganiza o layout: com a
+    /// janela fechada, a câmera da peça ocupa a tela toda.
+    /// </summary>
+    private void SetFaceWindowEnabled(bool enabled)
+    {
+        if (_config.FaceCameraEnabled == enabled)
+        {
+            SyncFaceToggleUi();
+            return;
+        }
+        _config.FaceCameraEnabled = enabled;
+        SaveConfig();
+        _engine.SetFaceCameraEnabled(enabled);
+        SyncFaceToggleUi();
+        ApplyCameraLayout();
+    }
+
+    private void SyncFaceToggleUi()
+    {
+        bool on = _config.FaceCameraEnabled;
+        _btnToggleFaceWindow.Text = on ? "JANELA DO ROSTO: LIGADA" : "JANELA DO ROSTO: DESLIGADA";
+        _faceCameraLabel.Text = on ? "CÂMERA DO ROSTO" : "CÂMERA DO ROSTO (desligada)";
+        _faceCameraLabel.BackColor = on ? Color.FromArgb(35, 35, 35) : Color.FromArgb(70, 30, 30);
+    }
+
+    /// <summary>
+    /// Layout modular: se há câmera de rosto configurada e disponível, mostra
+    /// os dois painéis (peça 70% / rosto 30%); senão, só o da peça em tela
+    /// cheia.
+    /// </summary>
+    private void ApplyCameraLayout()
+    {
+        bool showFace = _config.FaceCameraEnabled && _faceCameraAvailable;
+
+        _faceCameraPanel.Visible = showFace;
+        _previewGrid.ColumnStyles[0].SizeType = SizeType.Percent;
+        _previewGrid.ColumnStyles[1].SizeType = SizeType.Percent;
+        if (showFace)
+        {
+            _previewGrid.ColumnStyles[0].Width = 70f; // câmera da peça maior
+            _previewGrid.ColumnStyles[1].Width = 30f;
+        }
+        else
+        {
+            _previewGrid.ColumnStyles[0].Width = 100f; // só a câmera da peça
+            _previewGrid.ColumnStyles[1].Width = 0f;
+            var old = _facePreview.Image;
+            _facePreview.Image = null;
+            old?.Dispose();
+        }
+        SyncFaceToggleUi();
+    }
+
+    /// <summary>
+    /// Re-varre as câmeras do sistema (DSHOW) e preenche os dois combos com as
+    /// disponíveis e a resolução de cada uma. Precisa ser chamado com
+    /// _loadingUi já ligado, senão as mudanças de seleção disparam efeitos.
+    /// </summary>
+    private void RefreshCameraCombos()
+    {
+        var infos = CaptureEngine.FindAvailableCameras();
+        var desc = new Dictionary<int, string>();
+        foreach (var info in infos)
+            desc[info.Index] = info.Description;
+
+        var ordered = new List<int>();
+        foreach (var info in infos)
+            ordered.Add(info.Index);
+
+        // A câmera principal configurada pode estar aberta neste instante e o
+        // probe devolver "não encontrada"; mantém ela na lista mesmo assim.
+        if (!ordered.Contains(_config.CameraIndex))
+        {
+            ordered.Add(_config.CameraIndex);
+            desc[_config.CameraIndex] = "em uso";
+        }
+        ordered.Sort();
+
+        _availableCameras.Clear();
+        _availableCameras.AddRange(ordered);
+
+        _cameraOptions.Clear();
+        _cboCamera.Items.Clear();
+        foreach (int cam in ordered)
+        {
+            _cameraOptions.Add(cam);
+            _cboCamera.Items.Add($"Câmera {cam} — {desc[cam]}");
+        }
+        int mainSel = _cameraOptions.IndexOf(_config.CameraIndex);
+        if (mainSel >= 0)
+            _cboCamera.SelectedIndex = mainSel;
+        else if (_cboCamera.Items.Count > 0)
+            _cboCamera.SelectedIndex = 0;
+
+        _faceCameraOptions.Clear();
+        _faceCameraOptions.Add(-1);
+        _cboFaceCamera.Items.Clear();
+        _cboFaceCamera.Items.Add("Sem câmera de rosto");
+        foreach (int cam in ordered)
+        {
+            if (cam == _config.CameraIndex)
+                continue; // a mesma câmera não serve como câmera de rosto
+            _faceCameraOptions.Add(cam);
+            _cboFaceCamera.Items.Add($"Câmera {cam} — {desc[cam]}");
+        }
+        // Mantém o índice salvo na config mesmo se a câmera não apareceu agora.
+        if (_config.FaceCameraIndex >= 0 && !_faceCameraOptions.Contains(_config.FaceCameraIndex))
+        {
+            _faceCameraOptions.Add(_config.FaceCameraIndex);
+            _cboFaceCamera.Items.Add($"Câmera {_config.FaceCameraIndex} — indisponível agora");
+        }
+        int faceSel = _faceCameraOptions.IndexOf(_config.FaceCameraIndex);
+        if (faceSel >= 0)
+            _cboFaceCamera.SelectedIndex = faceSel;
+        else if (_cboFaceCamera.Items.Count > 0)
+            _cboFaceCamera.SelectedIndex = 0;
+
+        RefreshFaceOptionAvailability();
+    }
+
+    private void RefreshFaceOptionAvailability()
+    {
+        _faceCameraAvailable = _config.FaceCameraIndex >= 0
+            && _config.FaceCameraIndex != _config.CameraIndex
+            && _availableCameras.Contains(_config.FaceCameraIndex);
+    }
 
     // ---------------------------------------------------------------- Motor
 
@@ -1915,7 +2208,8 @@ public class MainForm : Form
 
     private void OnFacePreviewFrame(Mat frame)
     {
-        if (_isHiddenToTray || IsDisposed || Disposing)
+        // Janela oculta (desligada / sem câmera de rosto): ignora o quadro.
+        if (_isHiddenToTray || IsDisposed || Disposing || !_faceCameraPanel.Visible)
             return;
 
         Bitmap bmp;

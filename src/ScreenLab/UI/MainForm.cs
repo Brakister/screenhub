@@ -29,6 +29,7 @@ public class MainForm : Form
     private const int HOTKEY_ID_PAUSE = 2;
     private const int HOTKEY_ID_CAPTURE_FACE = 3;
     private const int HOTKEY_ID_TOGGLE_FACE_IN_PHOTO = 4;
+    private const int HOTKEY_ID_LEARN_FACE = 5;
     private const uint MOD_NOREPEAT = 0x4000;
 
     [DllImport("user32.dll")]
@@ -71,6 +72,7 @@ public class MainForm : Form
     private Panel _operatorsScroll = null!;
     private RoundedButton _btnCapture = null!;
     private RoundedButton _btnCaptureFace = null!;
+    private RoundedButton _btnLearnFace = null!;
     private RoundedButton _btnPause = null!;
     private RoundedButton _btnToggleFaceInPhoto = null!;
     private RoundedButton _btnSettings = null!;
@@ -105,6 +107,12 @@ public class MainForm : Form
     private NumericUpDown _numFaceVideoHeight = null!;
     private CheckBox _ckNotifications = null!;
     private CheckBox _ckStartup = null!;
+
+    // Auto-enrollment
+    private NumericUpDown _numAutoEnrollCosine = null!;
+    private NumericUpDown _numAutoEnrollConsecutive = null!;
+    private NumericUpDown _numAutoEnrollCooldown = null!;
+    private CheckBox _ckAutoEnrollEnabled = null!;
 
     public MainForm(bool startMinimized) : this(startMinimized, ConfigService.ConfigPath)
     {
@@ -294,13 +302,24 @@ public class MainForm : Form
         };
         _btnCaptureFace.Click += (s, e) => CaptureEnrollmentFromMain();
 
+        _btnLearnFace = new RoundedButton
+        {
+            Text = "APRENDER ROSTO ATUAL (F10)",
+            ButtonColor = Color.FromArgb(0, 120, 170),
+            ForeColor = Color.White,
+            Font = new Font(Font.FontFamily, 9f, FontStyle.Bold),
+            Location = new Point(10, 124),
+            Size = new Size(SideWidth - 20, 38),
+        };
+        _btnLearnFace.Click += (s, e) => LearnCurrentFace();
+
         _btnSettings = new RoundedButton
         {
             Text = "Configurações",
             ButtonColor = Color.FromArgb(72, 72, 80),
             ForeColor = Color.White,
             Font = new Font(Font.FontFamily, 9.5f, FontStyle.Bold),
-            Location = new Point(10, 126),
+            Location = new Point(10, 170),
             Size = new Size(112, 40),
         };
         _btnSettings.Click += (s, e) => ShowSettingsPage();
@@ -311,7 +330,7 @@ public class MainForm : Form
             ButtonColor = Color.FromArgb(110, 70, 25),
             ForeColor = Color.White,
             Font = new Font(Font.FontFamily, 9.5f, FontStyle.Bold),
-            Location = new Point(10, 126),
+            Location = new Point(10, 170),
             Size = new Size(112, 40),
         };
         _btnPause.Click += (s, e) => TogglePause();
@@ -322,7 +341,7 @@ public class MainForm : Form
             ButtonColor = Color.FromArgb(180, 60, 60),
             ForeColor = Color.White,
             Font = new Font(Font.FontFamily, 9.5f, FontStyle.Bold),
-            Location = new Point(130, 126),
+            Location = new Point(130, 170),
             Size = new Size(112, 40),
         };
         _btnToggleFaceInPhoto.Click += (s, e) => ToggleFaceInPhoto();
@@ -332,12 +351,13 @@ public class MainForm : Form
             Text = "A tecla ESPAÇO também tira foto",
             ForeColor = Color.FromArgb(120, 120, 128),
             Font = new Font(Font.FontFamily, 8f),
-            Location = new Point(10, 174),
+            Location = new Point(10, 218),
             AutoSize = true,
         };
 
         bottom.Controls.Add(_btnCapture);
         bottom.Controls.Add(_btnCaptureFace);
+        bottom.Controls.Add(_btnLearnFace);
         bottom.Controls.Add(_btnSettings);
         bottom.Controls.Add(_btnPause);
         bottom.Controls.Add(_btnToggleFaceInPhoto);
@@ -363,7 +383,7 @@ public class MainForm : Form
         tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));   // título
         tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));  // operadores
-        tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 205));  // ações
+        tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 250));  // ações
 
         tlp.Controls.Add(_lblOperatorsTitle, 0, 0);
         tlp.Controls.Add(_operatorsScroll, 0, 1);
@@ -481,6 +501,7 @@ public class MainForm : Form
         var col = new Panel { Width = SettingsGroupWidth, BackColor = Color.FromArgb(30, 30, 36) };
         AddGroup(col, BuildCaptureSettingsGroup());
         AddGroup(col, BuildUserGroup());
+        AddGroup(col, BuildAutoEnrollmentGroup());
         AddGroup(col, BuildCameraGroup());
         AddGroup(col, BuildGeneralGroup());
         int colH = 14;
@@ -739,6 +760,125 @@ public class MainForm : Form
         gb.Controls.Add(_btnEnrollFace);
         gb.Height = y + 84 + 28 + 14;
         return gb;
+    }
+
+    private GroupBox BuildAutoEnrollmentGroup()
+    {
+        var gb = NewGroup("Aprendizado por repetição (Auto-enrollment)");
+        int y = 12;
+
+        _ckAutoEnrollEnabled = NewCheck("Habilitar auto-enrollment adaptativo", 12, y);
+        _ckAutoEnrollEnabled.CheckedChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            if (_ckAutoEnrollEnabled.Checked)
+                ApplyAutoEnrollmentConfig();
+            else
+                _engine.DisableAutoEnrollment();
+        };
+        gb.Controls.Add(_ckAutoEnrollEnabled);
+        y += 27;
+
+        AddLabel(gb, "Confiança mínima (cosseno 0.0-1.0):", 12, y);
+        y += 20;
+        _numAutoEnrollCosine = new NumericUpDown
+        {
+            Minimum = 0,
+            Maximum = 1,
+            Increment = 0.01M,
+            DecimalPlaces = 2,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 0.55M,
+        };
+        _numAutoEnrollCosine.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            ApplyAutoEnrollmentConfig();
+        };
+        gb.Controls.Add(_numAutoEnrollCosine);
+        y += 30;
+
+        AddLabel(gb, "Reconhecimentos consecutivos necessários:", 12, y);
+        y += 20;
+        _numAutoEnrollConsecutive = new NumericUpDown
+        {
+            Minimum = 1,
+            Maximum = 20,
+            Increment = 1,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 3,
+        };
+        _numAutoEnrollConsecutive.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            ApplyAutoEnrollmentConfig();
+        };
+        gb.Controls.Add(_numAutoEnrollConsecutive);
+        y += 30;
+
+        AddLabel(gb, "Cooldown entre aprendizados (ms):", 12, y);
+        y += 20;
+        _numAutoEnrollCooldown = new NumericUpDown
+        {
+            Minimum = 500,
+            Maximum = 60000,
+            Increment = 500,
+            Width = 130,
+            Location = new Point(12, y),
+            Value = 5000,
+        };
+        _numAutoEnrollCooldown.ValueChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            ApplyAutoEnrollmentConfig();
+        };
+        gb.Controls.Add(_numAutoEnrollCooldown);
+        y += 30;
+
+        var btnTestLearn = new Button
+        {
+            Text = "Testar: aprender rosto atual (F10)",
+            Width = 312,
+            Height = 28,
+            FlatStyle = FlatStyle.System,
+            Location = new Point(12, y),
+        };
+        btnTestLearn.Click += (s, e) => LearnCurrentFace();
+        gb.Controls.Add(btnTestLearn);
+        y += 34;
+
+        var hint = new Label
+        {
+            Text = "Como funciona:\n" +
+                   "• Quando o sistema reconhece o usuário ativo com confiança ≥ mínima,\n" +
+                   "  incrementa um contador interno.\n" +
+                   "• Após N reconhecimentos consecutivos, adiciona automaticamente\n" +
+                   "  o embedding à galeria do usuário (melhora robustez).\n" +
+                   "• Cooldown evita adicionar poses muito similares em sequência.\n" +
+                   "• Use 'APRENDER ROSTO ATUAL (F10)' no painel lateral para forçar agora.",
+            AutoSize = true,
+            ForeColor = Color.DimGray,
+            Location = new Point(12, y),
+        };
+        gb.Controls.Add(hint);
+        y += hint.Height + 10;
+
+        gb.Height = y + 6;
+        return gb;
+    }
+
+    private void ApplyAutoEnrollmentConfig()
+    {
+        if (_engine == null) return;
+        float cosine = (float)_numAutoEnrollCosine.Value;
+        int consecutive = (int)_numAutoEnrollConsecutive.Value;
+        int cooldown = (int)_numAutoEnrollCooldown.Value;
+        if (_ckAutoEnrollEnabled.Checked)
+            _engine.ConfigureAutoEnrollment(cosine, consecutive, cooldown);
+        else
+            _engine.DisableAutoEnrollment();
     }
 
     private GroupBox BuildCameraGroup()
@@ -1344,6 +1484,46 @@ public class MainForm : Form
         ApplyStatus("Capturando pose facial...");
     }
 
+    private void LearnCurrentFace()
+    {
+        if (_engine.IsPaused || !_engine.IsRunning)
+        {
+            ApplyStatus("Motor pausado ou parado");
+            return;
+        }
+
+        _btnLearnFace.Enabled = false;
+        _btnLearnFace.Text = "APRENDENDO...";
+        _btnLearnFace.ButtonColor = Color.FromArgb(180, 120, 0);
+        ApplyStatus("Aprendendo rosto atual — olhe para a câmera de rosto");
+
+        _engine.LearnCurrentFace();
+    }
+
+    private void OnLearnFaceCompleted(bool success, string message)
+    {
+        SafeBeginInvoke(() =>
+        {
+            _btnLearnFace.Enabled = true;
+            _btnLearnFace.Text = "APRENDER ROSTO ATUAL (F10)";
+            _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170);
+            ApplyStatus(message);
+            if (success)
+            {
+                UpdateEnrollmentUi();
+                _btnLearnFace.ButtonColor = Color.FromArgb(0, 180, 60);
+                _ = Task.Delay(800).ContinueWith(_ => SafeBeginInvoke(() =>
+                    _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170)));
+            }
+            else
+            {
+                _btnLearnFace.ButtonColor = Color.FromArgb(200, 60, 60);
+                _ = Task.Delay(1500).ContinueWith(_ => SafeBeginInvoke(() =>
+                    _btnLearnFace.ButtonColor = Color.FromArgb(0, 120, 170)));
+            }
+        });
+    }
+
     private void UpdateEnrollmentCaptureButton(bool active, string text = "CAPTURAR POSE")
     {
         _btnCaptureFace.Text = text;
@@ -1369,6 +1549,12 @@ public class MainForm : Form
             _numFaceGrace.Value = Math.Clamp(_config.FaceSwitchGraceSeconds, 0, 600);
             _numFaceDwell.Value = Math.Clamp(_config.FaceCaptureDwellSeconds, 0, 600);
             _numFaceCooldown.Value = Math.Clamp(_config.FaceCaptureCooldownSeconds, 0, 86400);
+
+            _ckAutoEnrollEnabled.Checked = true;
+            _numAutoEnrollCosine.Value = 0.55M;
+            _numAutoEnrollConsecutive.Value = 3;
+            _numAutoEnrollCooldown.Value = 5000;
+            ApplyAutoEnrollmentConfig();
 
             _cboCamera.SelectedIndex = Math.Clamp(_config.CameraIndex, 0, 9);
             _cboFaceCamera.SelectedIndex = Math.Clamp(_config.FaceCameraIndex, 0, 9);
@@ -1465,6 +1651,7 @@ public class MainForm : Form
             _lblHeaderStatus.Text = "Erro";
             _led.SetIdle(Color.FromArgb(230, 45, 45)); // vermelho: sem captura
         });
+        _engine.LearnFaceCompleted += (success, message) => SafeBeginInvoke(() => OnLearnFaceCompleted(success, message));
     }
 
     private void ApplyStatus(string status)
@@ -1633,6 +1820,7 @@ public class MainForm : Form
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_CAPTURE, MOD_NOREPEAT, (uint)Keys.F9);
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_PAUSE, MOD_NOREPEAT, (uint)Keys.F8);
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_FACE_IN_PHOTO, MOD_NOREPEAT, (uint)Keys.P);
+        _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_LEARN_FACE, MOD_NOREPEAT, (uint)Keys.F10);
     }
 
     private void UnregisterHotkeys()
@@ -1642,6 +1830,7 @@ public class MainForm : Form
         UnregisterHotKey(Handle, HOTKEY_ID_CAPTURE);
         UnregisterHotKey(Handle, HOTKEY_ID_PAUSE);
         UnregisterHotKey(Handle, HOTKEY_ID_TOGGLE_FACE_IN_PHOTO);
+        UnregisterHotKey(Handle, HOTKEY_ID_LEARN_FACE);
         _hotkeysRegistered = false;
     }
 
@@ -1659,6 +1848,9 @@ public class MainForm : Form
                     break;
                 case HOTKEY_ID_TOGGLE_FACE_IN_PHOTO:
                     ToggleFaceInPhoto();
+                    break;
+                case HOTKEY_ID_LEARN_FACE:
+                    LearnCurrentFace();
                     break;
             }
         }

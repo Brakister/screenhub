@@ -122,6 +122,9 @@ public sealed class CaptureEngine : IDisposable
     public event Action<string, string>? FaceEnrollmentCanceled;
     public event Action<string, int, int, string, int>? FaceEnrollmentProgress;
 
+    /// <summary>Evento disparado quando o aprendizado de rosto atual completa (sucesso ou falha).</summary>
+    public event Action<bool, string>? LearnFaceCompleted;
+
     public CaptureEngine(AppConfig config, UserManager users)
     {
         _config = config;
@@ -191,6 +194,100 @@ public sealed class CaptureEngine : IDisposable
         {
             LoggerService.Info($"Cadastro facial encerrado: {user} ({reason})");
             FaceEnrollmentCanceled?.Invoke(user, reason);
+        }
+    }
+
+    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3, int cooldownMs = 5000)
+    {
+        _faceRecognizer.ConfigureAutoEnrollment(minCosine, minConsecutive, cooldownMs);
+    }
+
+    public void DisableAutoEnrollment()
+    {
+        _faceRecognizer.DisableAutoEnrollment();
+    }
+
+    public void LearnCurrentFace()
+    {
+        if (!_running || _paused)
+        {
+            LearnFaceCompleted?.Invoke(false, "Motor pausado ou parado");
+            return;
+        }
+        _pendingLearnFace = true;
+    }
+
+    private volatile bool _pendingLearnFace = false;
+
+    private void ProcessLearnCurrentFace(Mat faceFrame)
+    {
+        if (faceFrame == null || faceFrame.Empty())
+        {
+            LearnFaceCompleted?.Invoke(false, "Câmera de rosto indisponível");
+            return;
+        }
+
+        DetectFacesForPreview(faceFrame);
+        var faceBoxes = _lastFaceBoxes;
+        var faceLandmarks = _lastFaceLandmarks;
+
+        if (faceBoxes.Length == 0)
+        {
+            LearnFaceCompleted?.Invoke(false, "Nenhum rosto detectado na câmera");
+            return;
+        }
+        if (faceBoxes.Length > 1)
+        {
+            LearnFaceCompleted?.Invoke(false, "Múltiplos rostos detectados — mostre apenas 1");
+            return;
+        }
+
+        Rect faceRect = ScaleFaceRect(faceBoxes[0], faceFrame.Width, faceFrame.Height);
+        if (!FaceQualityOk(faceFrame, faceRect, out string qualityReason))
+        {
+            LearnFaceCompleted?.Invoke(false, $"Qualidade ruim: {qualityReason}");
+            return;
+        }
+
+        using var crop = new Mat(faceFrame, faceRect);
+        Point2f[]? cropLandmarks = LandmarksToCrop(
+            faceLandmarks.Length > 0 ? faceLandmarks[0] : null, faceRect, faceFrame.Width, faceFrame.Height);
+
+        if (!TryAlignFace(crop, cropLandmarks, out Mat aligned))
+        {
+            LearnFaceCompleted?.Invoke(false, "Falha ao alinhar rosto");
+            return;
+        }
+
+        using (aligned)
+        {
+            float[]? embedding = _faceRecognizer.EmbedFace(aligned);
+            if (embedding == null)
+            {
+                LearnFaceCompleted?.Invoke(false, "Modelo de reconhecimento indisponível");
+                return;
+            }
+
+            string activeUser = _users.ActiveUser;
+            bool added = _faceRecognizer.AddLearningSample(activeUser, embedding);
+            if (added)
+            {
+                if (_users.AddFaceTemplate(activeUser, embedding))
+                {
+                    _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
+                    LoggerService.Info($"[LearnFace] Rosto aprendido para '{activeUser}' (total poses: {_users.FaceTemplateCount(activeUser)})");
+                    LearnFaceCompleted?.Invoke(true, $"Rosto aprendido para '{activeUser}' ({_users.FaceTemplateCount(activeUser)} poses)");
+                }
+                else
+                {
+                    _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
+                    LearnFaceCompleted?.Invoke(false, "Falha ao salvar no disco");
+                }
+            }
+            else
+            {
+                LearnFaceCompleted?.Invoke(false, "Rosto muito similar a pose existente (não adicionado)");
+            }
         }
     }
 
@@ -500,6 +597,19 @@ public sealed class CaptureEngine : IDisposable
                 }
                 swRead.Stop();
                 Accumulate(ref _readMs, swRead.ElapsedMilliseconds);
+
+                if (_pendingLearnFace)
+                {
+                    _pendingLearnFace = false;
+                    if (faceReadOk && faceFrame != null)
+                    {
+                        ProcessLearnCurrentFace(faceFrame);
+                    }
+                    else
+                    {
+                        LearnFaceCompleted?.Invoke(false, "Câmera de rosto indisponível");
+                    }
+                }
 
                 var swDetect = Stopwatch.StartNew();
                 bool fire = false;

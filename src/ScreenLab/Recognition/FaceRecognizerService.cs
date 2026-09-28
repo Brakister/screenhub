@@ -29,6 +29,13 @@ public sealed class FaceRecognizerService : IDisposable
     private float _selfSimilarityFactor = 0.80f;
     private int _maxPosesPerUser = 20;
 
+    // --- Auto-enrollment adaptativo (aprendizado por repetição) ---
+    private float _autoEnrollMinCosine = 0.55f;
+    private int _autoEnrollMinConsecutive = 3;
+    private int _autoEnrollCooldownMs = 5000;
+    private readonly Dictionary<string, int> _consecutiveHits = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _lastAutoEnroll = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Galeria: nome do usuário → várias poses L2-normalizadas.</summary>
     private readonly Dictionary<string, List<float[]>> _gallery = new(StringComparer.OrdinalIgnoreCase);
 
@@ -55,6 +62,20 @@ public sealed class FaceRecognizerService : IDisposable
     }
 
     public string ModelTypeName => _modelType.ToString();
+
+    public void ConfigureAutoEnrollment(float minCosine = 0.55f, int minConsecutive = 3, int cooldownMs = 5000)
+    {
+        _autoEnrollMinCosine = minCosine;
+        _autoEnrollMinConsecutive = minConsecutive;
+        _autoEnrollCooldownMs = cooldownMs;
+        LoggerService.Info($"Auto-enrollment configurado: minCosine={minCosine:F2}, minConsecutive={minConsecutive}, cooldown={cooldownMs}ms");
+    }
+
+    public void DisableAutoEnrollment()
+    {
+        _autoEnrollMinConsecutive = int.MaxValue;
+        LoggerService.Info("Auto-enrollment desabilitado");
+    }
 
     public void ResetGallery(IEnumerable<KeyValuePair<string, List<float[]>>> templates)
     {
@@ -108,6 +129,29 @@ public sealed class FaceRecognizerService : IDisposable
             return string.Join(", ", _gallery.Select(g =>
                 $"{g.Key}:{g.Value.Count} poses (auto={SelfSimilarity(g.Value):F3})"));
         }
+    }
+
+    public bool AddLearningSample(string name, float[] embedding) => UpsertTemplate(name, embedding);
+
+    public bool AddLearningSample(string name, Mat face)
+    {
+        var emb = EmbedFace(face);
+        return emb != null && UpsertTemplate(name, emb);
+    }
+
+    public (int TotalUsers, int PendingHits, Dictionary<string, int> UserHits) GetAutoEnrollmentStats()
+    {
+        lock (_gallery)
+        {
+            var userHits = new Dictionary<string, int>(_consecutiveHits, StringComparer.OrdinalIgnoreCase);
+            return (_gallery.Count, _consecutiveHits.Values.Sum(), userHits);
+        }
+    }
+
+    public void ResetAutoEnrollmentCounters()
+    {
+        _consecutiveHits.Clear();
+        _lastAutoEnroll.Clear();
     }
 
     /// <summary>
@@ -202,8 +246,56 @@ public sealed class FaceRecognizerService : IDisposable
 
             if (bestSelf > 0f && bestCos < bestSelf * _selfSimilarityFactor) return null;
 
+            TryAutoEnroll(best, embedding, bestCos);
+
             return (best, bestCos);
         }
+    }
+
+    private void TryAutoEnroll(string name, float[] embedding, float cosine)
+    {
+        if (cosine < _autoEnrollMinCosine) return;
+
+        lock (_gallery)
+        {
+            int hits = _consecutiveHits.GetValueOrDefault(name, 0) + 1;
+            _consecutiveHits[name] = hits;
+
+            if (hits < _autoEnrollMinConsecutive) return;
+
+            if (_lastAutoEnroll.TryGetValue(name, out var lastTime))
+            {
+                var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
+                if (elapsed < _autoEnrollCooldownMs) return;
+            }
+
+            bool added = UpsertTemplateInternal(name, embedding);
+            if (added)
+            {
+                _lastAutoEnroll[name] = DateTime.UtcNow;
+                LoggerService.Info($"[Auto-enroll] '{name}' - embedding adicionado à galeria (cos={cosine:F3}, hits={hits}). Total poses: {_gallery[name].Count}");
+            }
+
+            _consecutiveHits[name] = 0;
+        }
+    }
+
+    private bool UpsertTemplateInternal(string name, float[] embedding)
+    {
+        var normalized = Normalize(embedding);
+        if (normalized == null)
+            return false;
+
+        if (!_gallery.TryGetValue(name, out var templates))
+            _gallery[name] = templates = new List<float[]>();
+
+        if (templates.Any(template => Cosine(template, normalized) > 0.995f))
+            return false;
+
+        templates.Add(normalized);
+        if (templates.Count > _maxPosesPerUser)
+            templates.RemoveRange(0, templates.Count - _maxPosesPerUser);
+        return true;
     }
 
     private static bool IsUsable(float[] v)
@@ -260,7 +352,9 @@ public sealed class FaceRecognizerService : IDisposable
         if (_net != null || _loadFailed) return;
         try
         {
-            Net net = CvDnn.ReadNetFromOnnx(_modelPath);
+            Net? net = CvDnn.ReadNetFromOnnx(_modelPath);
+            if (net == null)
+                throw new InvalidOperationException("ReadNetFromOnnx não retornou uma rede.");
             _net = net;
 
             // Detecta tipo de modelo pelo output dimension

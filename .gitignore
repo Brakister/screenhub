@@ -1,7 +1,6 @@
 # .NET
 bin/
 obj/
-publicacao/
 *.user
 
 # IDE
@@ -13,9 +12,11 @@ publicacao/
 # Logs locais
 *.log
 
+# Saida de build/publicacao (dotnet publish -o publish + instalador ISCC)
+publish/
+
 # Capturas temporarias do ambiente
 shot_current.png
-publish/
 
 # Lixo de investigacao: probes com uma copia de 61 MB do OpenCvSharpExtern.dll
 # e PNGs de debug. Ja esteve no remoto, mas nao deve voltar.

@@ -25,7 +25,7 @@ para os operadores acompanharem a pré-visualização em tempo real.
 
 ## Como usar
 
-1. Inicie o `ScreenLab.exe` (pasta `publicacao` ou `bin\Release\net8.0-windows`).
+1. Inicie o `ScreenLab.exe` (pasta `publish` ou `bin\Release\net8.0-windows\win-x64`).
 2. Selecione o operador na lista **Usuário**.
 3. Deixe a janela visível e oriente a câmera para o local desejado.
 4. Para fotografar: **botão verde "TIRAR FOTO"** ou tecla **ESPAÇO** — aparece o
@@ -73,11 +73,12 @@ Pré-requisito: **.NET 8 SDK** (ou superior).
 dotnet build src\ScreenLab\ScreenLab.csproj -c Release
 
 # Publicar executável autônomo (sem precisar de .NET instalado no alvo)
-dotnet publish src\ScreenLab\ScreenLab.csproj -c Release -r win-x64 --self-contained true -o publicacao
+dotnet publish src\ScreenLab\ScreenLab.csproj -c Release -r win-x64 --self-contained true -o publish
 ```
 
-Depois de publicar, copie a pasta `publicacao` inteira para o computador
-destino e rode `ScreenLab.exe`.
+Sai **um `.exe` só** em `publish\ScreenLab.exe` (~146 MB), com os modelos
+embutidos dentro. Copie esse arquivo para o computador destino e rode.
+Para gerar o instalador `.exe` de fato, veja [BUILD.md](BUILD.md).
 
 ## Ajustes rápidos (config.json)
 
@@ -87,7 +88,11 @@ Arquivo: `%APPDATA%\ScreenLab\config.json`
 |-------|-----------|--------|
 | `cameraIndex` | Índice da webcam (0 = primeira) | 0 |
 | `cooldownSeconds` | Pausa mínima entre fotos (evita disparo duplo) | 5 |
-| `videoWidth/videoHeight` | Resolução da captura | 1280×720 |
+| `videoWidth/videoHeight` | Resolução da captura | 1920×1080 |
+| `faceCameraIndex` | Índice da 2ª webcam (detecção de rosto) | — |
+| `faceEnabled` | Liga a câmera de rosto | false |
+| `faceVideoWidth/faceVideoHeight` | Resolução da câmera de rosto | 640×480 |
+| `faceIntervalMs` | Intervalo entre reconhecimentos (ms) | 400 |
 | `outputFolder` | Pasta de destino das fotos | `...\Pictures\ScreenLab` |
 
 A pasta de fotos é criada automaticamente como
@@ -97,6 +102,12 @@ A pasta de fotos é criada automaticamente como
 
 - **"Câmera X indisponível"** — verifique conexão/drivers e teste outro índice
   no botão **Testar**. O sistema tenta reabrir automaticamente a cada 2 s.
+- **Preview travado ou "atrasado"** — confira a linha `STATS` no log: `preview`
+  é o fps entregue à tela e `rosto` o da 2ª webcam. Abaixo de ~20 fps num dos
+  dois, nenhum ajuste do app resolve: é a câmera ou o cabo. Duas webcams 1080p
+  no mesmo hub USB 2.0 saturam a banda — a de rosto deve ficar em 640×480
+  (é o padrão). O log também avisa sozinho quando a resolução pedida é
+  ignorada pelo driver.
 - **Foto não sai ao apertar o botão** — confira se a captura não está **Pausada**
   (LED permanece vermelho e o botão fica desabilitado) ou se ainda não passou o
   tempo mínimo entre fotos.

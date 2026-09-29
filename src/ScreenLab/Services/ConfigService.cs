@@ -56,6 +56,21 @@ public class AppConfig
     /// <summary>Só dispara captura por rosto quando a pessoa foi reconhecida com segurança.</summary>
     public bool FaceCaptureRequireKnown { get; set; } = true;
 
+    // --- Várias pessoas no mesmo quadro ---
+    /// <summary>
+    /// Resolve quem é quem quando aparecem duas ou mais pessoas, respeitando a
+    /// regra de que cada pessoa ocupa no máximo um rosto, e tira uma foto por
+    /// pessoa. Desligado, o app volta a ignorar quadros com mais de um rosto.
+    /// </summary>
+    public bool FaceMultiPerson { get; set; } = true;
+    /// <summary>
+    /// Aprende sozinho um rosto estável que não pertence a ninguém da galeria,
+    /// gravando-o no operador que o usuário acabou de escolher na tela. Só
+    /// acontece logo após uma escolha explícita: sem isso, bastaria alguém
+    /// qualquer parar na frente da câmera para virar o dono.
+    /// </summary>
+    public bool FaceAutoLearnNew { get; set; } = true;
+
     public string OutputFolder { get; set; } = "";
     public bool NotificationsEnabled { get; set; } = true;
     public bool StartWithWindows { get; set; } = false;

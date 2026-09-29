@@ -117,6 +117,30 @@ public sealed class CaptureEngine : IDisposable
     private readonly Dictionary<string, DateTime> _lastPhotoByUser = new(StringComparer.OrdinalIgnoreCase);
     private volatile string _faceCaptureUser = "";
 
+    // --- Várias pessoas no mesmo quadro ---------------------------------------
+    // Na empresa não existem duas pessoas com o mesmo nome, então cada nome
+    // ocupa no máximo um rosto. Com esse dado, dá para transformar o quadro com
+    // duas pessoas (que antes era todo descartado) em uma foto por pessoa, cada
+    // uma com o nome certo. O operador ativo NÃO é tocado aqui: com duas
+    // pessoas na frente, "quem é o operador agora" não tem resposta estável.
+    private static readonly List<FaceShot> NoShots = new();
+    private readonly Dictionary<string, DateTime> _multiFaceSince = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _lastMultiFaceLogAt = DateTime.MinValue;
+
+    // --- Aprendizado de rosto novo -------------------------------------------
+    // Um rosto que não bate com ninguém da galeria vira pose do operador escolhido
+    // na tela, mas só depois de aparecer em vários quadros seguidos que parecem
+    // entre si. Isso separa "a mesma pessoa" de "alguém passando", e a exigência
+    // de escolha recente do operador separa o dono de um visitante.
+    private static readonly TimeSpan NewFaceCooldown = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan OperatorChoiceWindow = TimeSpan.FromMinutes(2);
+    private const float NewFaceStabilityCosine = 0.75f;
+    private const int NewFaceMinHits = 8;
+    private float[]? _newFaceLastEmbedding;
+    private int _newFaceHits;
+    private DateTime _nextNewFaceEnrollAt = DateTime.MinValue;
+    private DateTime _operatorChosenAt = DateTime.MinValue;
+
     private readonly object _stateLock = new();
     private VideoCapture? _capture;
     private VideoCapture? _faceCapture;
@@ -225,8 +249,12 @@ public sealed class CaptureEngine : IDisposable
     /// </summary>
     public void NotifyOperatorChosenByUser(string name)
     {
-        if (!string.IsNullOrWhiteSpace(name))
-            _operatorChosenByUser = name;
+        if (string.IsNullOrWhiteSpace(name)) return;
+        _operatorChosenByUser = name;
+        // O carimbo é o que autoriza o aprendizado de rosto novo: sem uma
+        // escolha feita na tela nos últimos instantes, ninguém pode ser
+        // assuming como o dono do rosto que está passando pela câmera.
+        _operatorChosenAt = DateTime.Now;
     }
 
     /// <summary>Se o rosto detectado pode trocar o operador selecionado.</summary>
@@ -901,7 +929,11 @@ public sealed class CaptureEngine : IDisposable
                 Point2f[][] faceLandmarks = _lastFaceLandmarks;
                 Mat? captureFaceFrame = faceFrame;
                 string trigger = _pendingManualTrigger;
-                
+                // Começa vazia de propósito: um disparo manual ou por intervalo
+                // no mesmo quadro de uma detecção facial não pode herdar as
+                // pessoas que sobraram da leitura anterior.
+                List<FaceShot> faceShots = NoShots;
+
                 // Disparo manual (ESPAÇO/F9/botão/bandeja) — roda detecção facial AGORA
                 // para ter caixas/frame frescos na composição.
                 if (!string.IsNullOrEmpty(trigger))
@@ -910,7 +942,7 @@ public sealed class CaptureEngine : IDisposable
                     bool forceFace = string.Equals(trigger, "Manual c/ Rosto", StringComparison.OrdinalIgnoreCase);
                     if (faceReadOk && faceFrame != null)
                     {
-                        Detect(faceFrame, out _, out faceBoxes, out faceLandmarks);
+                        Detect(faceFrame, out _, out faceBoxes, out faceLandmarks, out _);
                         captureFaceFrame = faceFrame;
                     }
                     // Fallback: usa as últimas caixas conhecidas do preview.
@@ -929,7 +961,7 @@ public sealed class CaptureEngine : IDisposable
                 // gasta CPU, como reinicia o relógio de "mesma pessoa há N s" e
                 // pode contar a mesma pose duas vezes na galeria.
                 else if (faceReadOk && faceFrameIsNew && faceFrame != null &&
-                         Detect(faceFrame, out trigger, out faceBoxes, out faceLandmarks))
+                         Detect(faceFrame, out trigger, out faceBoxes, out faceLandmarks, out faceShots))
                 {
                     fire = true;
                 }
@@ -967,7 +999,7 @@ public sealed class CaptureEngine : IDisposable
                 if (fire)
                 {
                     var swSave = Stopwatch.StartNew();
-                    CaptureAndSave(frame, trigger, captureFaceFrame, faceBoxes);
+                    CaptureAndSave(frame, trigger, captureFaceFrame, faceBoxes, faceShots);
                     swSave.Stop();
                     Accumulate(ref _saveMs, swSave.ElapsedMilliseconds);
                 }
@@ -1423,9 +1455,11 @@ public sealed class CaptureEngine : IDisposable
 
     /// <summary>Detecção facial + reconhecimento sobre o quadro da câmera do rosto.
     /// Atualiza caixas/landmarks sempre; retorna true só se gatilho de captura (rosto confirmado).</summary>
-    private bool Detect(Mat frame, out string trigger, out Rect[] faceBoxes, out Point2f[][] faceLandmarks)
+    private bool Detect(Mat frame, out string trigger, out Rect[] faceBoxes,
+        out Point2f[][] faceLandmarks, out List<FaceShot> shots)
     {
         trigger = "";
+        shots = NoShots;
         bool detectFaces = _yunet != null || _faceCascade != null || _profileFaceCascade != null;
         if (!detectFaces || _faceWatch.ElapsedMilliseconds < _config.FaceIntervalMs)
         {
@@ -1438,7 +1472,8 @@ public sealed class CaptureEngine : IDisposable
         (faceBoxes, faceLandmarks) = DetectFacesInFrame(frame);
         _lastFaceBoxes = faceBoxes;      // Sempre atualiza para preview
         _lastFaceLandmarks = faceLandmarks;
-        if (ProcessFaceRecognition(frame, faceBoxes, faceLandmarks))
+        shots = ProcessFaceRecognition(frame, faceBoxes, faceLandmarks);
+        if (shots.Count > 0)
         {
             trigger = "Rosto";
             return true;
@@ -1721,11 +1756,22 @@ public sealed class CaptureEngine : IDisposable
         return kept;
     }
 
-    /// <returns>True somente quando todos os gates liberaram uma foto.</returns>
-    private bool ProcessFaceRecognition(Mat frame, Rect[] faces, Point2f[][] landmarks)
+    /// <summary>
+    /// Uma pessoa e a caixa que a representa no quadro. É o que permite tirar
+    /// uma foto por pessoa quando há várias no mesmo quadro — o antigo booleano
+    /// só dizia "algum rosto está pronto", sem dizer qual.
+    /// </summary>
+    private readonly record struct FaceShot(string User, Rect Box, int FaceIndex);
+
+    /// <summary>
+    /// Decide o que fazer com os rostos do quadro. Devolve as pessoas que
+    /// liberaram todos os gates de captura; lista vazia = nenhuma foto.
+    /// </summary>
+    private List<FaceShot> ProcessFaceRecognition(Mat frame, Rect[] faces, Point2f[][] landmarks)
     {
         _lastFaceLabels = new string[faces.Length];
         DateTime now = DateTime.Now;
+        var shots = new List<FaceShot>();
 
         // A manutenção da sessão de cadastro roda ANTES de qualquer saída
         // antecipada. Se ficasse depois, um cadastro aberto com a pessoa longe
@@ -1745,7 +1791,8 @@ public sealed class CaptureEngine : IDisposable
         {
             ResetTrackedIdentity();
             ResetFaceDwell();
-            return false;
+            _multiFaceSince.Clear();
+            return shots;
         }
 
         if (!string.IsNullOrEmpty(enrollmentUser))
@@ -1756,20 +1803,30 @@ public sealed class CaptureEngine : IDisposable
             ResetTrackedIdentity();
             ResetFaceDwell();
             ProcessFaceEnrollment(frame, faces, landmarks, enrollmentUser, now);
-            return false;
+            return shots;
         }
 
-        // Com mais de uma pessoa no quadro não existe identidade individual
-        // confiável. Mostramos os rótulos, mas nunca mudamos o usuário nem
-        // capturamos: isso evita atribuir a foto de uma pessoa ao operador da outra.
+        // Mais de uma pessoa no quadro. Antes isso descartava tudo; agora cada
+        // uma recebe o seu nome e a sua foto, desde que a atribuição seja firme.
         if (faces.Length > 1)
         {
             ResetTrackedIdentity();
             ResetFaceDwell();
-            for (int i = 0; i < faces.Length; i++)
-                DescribeFaceWithoutTracking(frame, faces[i],
-                    i < landmarks.Length ? landmarks[i] : null, i);
-            return false;
+            // NÃO limpa _multiFaceSince aqui: esse dicionário é a contagem de
+            // permanência por pessoa, e limpar a cada quadro (o reconhecimento
+            // roda a cada 400 ms) jamais deixaria o relógio chegar em 1. Quem
+            // some do quadro é removido no fim de ProcessMultiFace.
+            if (_config.FaceMultiPerson)
+            {
+                ProcessMultiFace(frame, faces, landmarks, now, shots);
+            }
+            else
+            {
+                for (int i = 0; i < faces.Length; i++)
+                    DescribeFaceWithoutTracking(frame, faces[i],
+                        i < landmarks.Length ? landmarks[i] : null, i);
+            }
+            return shots;
         }
 
         Rect faceRect = ScaleFaceRect(faces[0], frame.Width, frame.Height);
@@ -1778,7 +1835,7 @@ public sealed class CaptureEngine : IDisposable
             _lastFaceLabels[0] = qualityReason;
             ResetTrackedIdentity();
             ResetFaceDwell();
-            return false;
+            return shots;
         }
 
         // A opção sem exigeência é explícita: nesse modo a pessoa continua
@@ -1788,7 +1845,9 @@ public sealed class CaptureEngine : IDisposable
         {
             string activeUser = _users.ActiveUser;
             _lastFaceLabels[0] = $"{activeUser} (sem confirmar)";
-            return UpdateFaceCaptureGate(activeUser, now);
+            if (UpdateFaceCaptureGate(activeUser, now))
+                shots.Add(new FaceShot(activeUser, faceRect, 0));
+            return shots;
         }
 
         using var crop = new Mat(frame, faceRect);
@@ -1799,7 +1858,7 @@ public sealed class CaptureEngine : IDisposable
             _lastFaceLabels[0] = "ALINHAMENTO FALHOU";
             ResetTrackedIdentity();
             ResetFaceDwell();
-            return false;
+            return shots;
         }
 
         using (aligned)
@@ -1811,7 +1870,7 @@ public sealed class CaptureEngine : IDisposable
                 _lastFaceLabels[0] = "MODELO INDISPONIVEL";
                 ResetTrackedIdentity();
                 ResetFaceDwell();
-                return false;
+                return shots;
             }
 
             // Mede o quanto está de perfil e registra a comparação completa,
@@ -1827,7 +1886,8 @@ public sealed class CaptureEngine : IDisposable
                     : "DESCONHECIDO";
                 ResetTrackedIdentity();
                 ResetFaceDwell();
-                return false;
+                TryAutoLearnNewFace(embedding, now);
+                return shots;
             }
 
             LogRecognitionRanking(result.Name, embedding, yaw);
@@ -1840,7 +1900,7 @@ public sealed class CaptureEngine : IDisposable
                     : "AGUARDANDO TROCA";
                 _lastFaceLabels[0] = $"{result.Name} {phase} {Math.Max(1, (int)Math.Ceiling(remainingSeconds))}s";
                 ResetFaceDwell();
-                return false;
+                return shots;
             }
 
             _lastFaceLabels[0] = $"{result.Name} {result.Confidence:P0}"
@@ -1852,8 +1912,292 @@ public sealed class CaptureEngine : IDisposable
             TryAutoEnrollConfirmed(result.Name, embedding, result.Confidence);
 
             TryPersistRecognitionSample(result.Name, embedding, now);
-            return UpdateFaceCaptureGate(result.Name, now);
+            if (UpdateFaceCaptureGate(result.Name, now))
+                shots.Add(new FaceShot(result.Name, faceRect, 0));
+            return shots;
         }
+    }
+
+    /// <summary>
+    /// Resolve quem é quem quando há mais de uma pessoa no quadro.
+    ///
+    /// O nome de cada rosto sai de <see cref="FaceAssignment.Assign"/>, que
+    /// decide o quadro inteiro de uma vez: cada nome ocupa no máximo um rosto.
+    /// Isso elimina o pior erro possível — duas pessoas saindo da mesma foto
+    /// carimbadas com o mesmo nome — e ainda fotografa cada uma separadamente.
+    ///
+    /// O operador ativo NÃO é tocado aqui. Com duas pessoas na frente, "quem é
+    /// o operador agora" não tem resposta estável, e trocar isso a cada quadro
+    /// sujaria justamente as fotos que o operador tirou na mão.
+    /// </summary>
+    private void ProcessMultiFace(
+        Mat frame, Rect[] faces, Point2f[][] landmarks, DateTime now, List<FaceShot> shots)
+    {
+        int total = faces.Length;
+        var rects = new Rect[total];
+        var embeddings = new float[total][];
+        var validos = new bool[total];
+        var yaws = new double[total];
+        var rankings = new List<IReadOnlyList<(string Name, float Cosine)>>(total);
+
+        // 1) Prepara cada rosto: qualidade, alinhamento e embedding. Um rosto
+        //    ruim fica sem par nenhum na atribuição — o algoritmo nunca escolhe
+        //    uma célula vazia, então ele simplesmente sai fora.
+        for (int i = 0; i < total; i++)
+        {
+            Rect rect = ScaleFaceRect(faces[i], frame.Width, frame.Height);
+            rects[i] = rect;
+            if (!FaceQualityOk(frame, rect, out string reason))
+            {
+                _lastFaceLabels[i] = reason;
+                rankings.Add(Array.Empty<(string, float)>());
+                continue;
+            }
+
+            using var crop = new Mat(frame, rect);
+            Point2f[]? cropLandmarks = LandmarksToCrop(
+                i < landmarks.Length ? landmarks[i] : null, rect, frame.Width, frame.Height);
+            if (!TryAlignFace(crop, cropLandmarks, out Mat aligned))
+            {
+                _lastFaceLabels[i] = "ALINHAMENTO FALHOU";
+                rankings.Add(Array.Empty<(string, float)>());
+                continue;
+            }
+
+            using (aligned)
+            {
+                float[]? embedding = _faceRecognizer.EmbedFace(aligned);
+                if (embedding == null)
+                {
+                    _lastFaceLabels[i] = "MODELO INDISPONIVEL";
+                    rankings.Add(Array.Empty<(string, float)>());
+                    continue;
+                }
+                embeddings[i] = embedding;
+                validos[i] = true;
+                yaws[i] = EstimateHeadYaw(cropLandmarks);
+                rankings.Add(_faceRecognizer.RankAll(embedding));
+            }
+        }
+
+        // 2) Uma resolução para o quadro inteiro. Nada de decidir rosto por
+        //    rosto: a decisão precisa enxergar quem está ao lado.
+        var atribuidos = FaceAssignment.Assign(rankings);
+
+        // 3) Rótulo e foto de cada rosto.
+        var presentes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var resumo = new List<string>(total);
+        float minimo = _faceRecognizer.MinimumCosine;
+        float margemMin = _faceRecognizer.MinimumMargin;
+
+        for (int i = 0; i < total; i++)
+        {
+            if (!validos[i]) continue;   // o rótulo já é o motivo da recusa
+
+            var ranking = rankings[i];
+            string? nome = i < atribuidos.Count ? atribuidos[i] : null;
+            if (nome == null)
+            {
+                _lastFaceLabels[i] = yaws[i] > 25
+                    ? $"DESCONHECIDO (perfil {yaws[i]:F0}°)"
+                    : "DESCONHECIDO";
+                resumo.Add($"#{i} {DescreverCaixa(rects[i])} {DescreverRanking(ranking)} -> ninguem");
+                continue;
+            }
+
+            // Uma passada só, sem LINQ: a escolha e o melhor rival saem juntos.
+            // A margem continua sendo contra TODAS as outras pessoas, e não só
+            // contra as que sobraram na atribuição. Se o melhor rival deste
+            // rosto for melhor que a escolha, a atribuição não é crível — e
+            // nesse caso é melhor não fotografar do que carimbar errado.
+            float escolhida = 0f;
+            float rival = 0f;
+            bool achou = false;
+            foreach (var (outro, cos) in ranking)
+            {
+                if (string.Equals(outro, nome, StringComparison.OrdinalIgnoreCase))
+                {
+                    escolhida = cos;
+                    achou = true;
+                }
+                else if (cos > rival)
+                {
+                    rival = cos;
+                }
+            }
+            float margem = escolhida - rival;
+
+            if (!achou)
+            {
+                // Não deveria acontecer: Assign só devolve nomes que vieram do
+                // próprio ranking. Se vier, é bug — e rótulo neutro é melhor
+                // que exceção na thread da câmera.
+                _lastFaceLabels[i] = "DESCONHECIDO";
+                LoggerService.Warn($"Atribuição devolveu '{nome}', que não está no ranking do rosto #{i}");
+                continue;
+            }
+
+            // O nome tem de ser o melhor candidato DO PRÓPRIO rosto, e não só o
+            // melhor que sobrou na atribuição. Sem isso, o app "sabia" que o
+            // rosto se parecia mais com o Victor, mesmo assim carimbava Ailton
+            // porque o Victor já estava na outra caixa — e saía uma foto da MESMA
+            // pessoa com dois nomes diferentes. Recusar aqui não perde nada: o
+            // único caso em que a atribuição força um nome é justamente o
+            // ambíguo, que a margem abaixo já recusaria.
+            bool proprioVencedor = ranking.Count > 0 &&
+                string.Equals(ranking[0].Name, nome, StringComparison.OrdinalIgnoreCase);
+
+            resumo.Add($"#{i} {DescreverCaixa(rects[i])} {DescreverRanking(ranking)} -> {nome} "
+                + $"(cos {escolhida:F3}, margem {margem:F3}, "
+                + $"{(proprioVencedor ? "proprio" : "forcado")})");
+
+            if (!proprioVencedor || escolhida < minimo || margem < margemMin)
+            {
+                _lastFaceLabels[i] = proprioVencedor
+                    ? $"{nome} {escolhida:P0} ambíguo"
+                    : "DESCONHECIDO";
+                if (yaws[i] > 25) _lastFaceLabels[i] += $" (perfil {yaws[i]:F0}°)";
+                continue;
+            }
+
+            presentes.Add(nome);
+
+            // Mesma barreira do caminho de rosto único: a pessoa precisa ficar
+            // no quadro por FaceConfirmSeconds antes de entrar na foto.
+            if (!_multiFaceSince.TryGetValue(nome, out DateTime desde))
+            {
+                desde = now;
+                _multiFaceSince[nome] = now;
+            }
+            double presenteHa = Math.Max(0, (now - desde).TotalSeconds);
+            double necessario = Math.Max(Math.Max(0, _config.FaceConfirmSeconds),
+                                         Math.Max(0, _config.FaceCaptureDwellSeconds));
+            if (presenteHa < necessario)
+            {
+                int restante = Math.Max(1, (int)Math.Ceiling(necessario - presenteHa));
+                _lastFaceLabels[i] = $"{nome} {escolhida:P0} AGUARDANDO {restante}s";
+                continue;
+            }
+
+            _lastFaceLabels[i] = $"{nome} {escolhida:P0}"
+                + (yaws[i] > 25 ? $" (perfil {yaws[i]:F0}°)" : "");
+
+            // A galeria de cada um cresce no ritmo do próprio cooldown e da
+            // própria checagem de duplicata, sem passar pela confirmação global
+            // de identidade (que aqui não existe: são várias pessoas ao mesmo
+            // tempo e o "operador do momento" não tem sentido).
+            if (_faceRecognizer.EvaluateAutoEnroll(nome, embeddings[i], escolhida) ==
+                FaceRecognizerService.AutoEnrollDecision.Accepted)
+            {
+                EnqueueEmbeddingWrite(nome, (float[])embeddings[i].Clone());
+            }
+
+            if (TryMultiFaceCaptureGate(nome, now))
+                shots.Add(new FaceShot(nome, rects[i], i));
+        }
+
+        // Quem saiu do quadro perde a contagem de permanência: voltar exige
+        // confirmar de novo, senão um nome que piscou no vídeo já fotografaria.
+        foreach (var saiu in _multiFaceSince.Keys.Where(k => !presentes.Contains(k)).ToList())
+            _multiFaceSince.Remove(saiu);
+
+        LogMultiFace(resumo);
+    }
+
+    /// <summary>
+    /// Janela de captura de uma pessoa dentro de um quadro com várias. Reusa os
+    /// mesmos tempos do caminho de rosto único, mas o estado é por pessoa: duas
+    /// pessoas no mesmo quadro não podem compartilhar a mesma janela, e uma
+    /// delas não pode "gastar" o intervalo da outra.
+    /// </summary>
+    private bool TryMultiFaceCaptureGate(string user, DateTime now)
+    {
+        if (!_config.FaceEnabled) return false;
+        if ((now - _lastCapture).TotalSeconds < Math.Max(0, _config.CooldownSeconds))
+            return false;
+        if (_lastPhotoByUser.TryGetValue(user, out DateTime last) &&
+            (now - last).TotalSeconds < Math.Max(0, _config.FaceCaptureCooldownSeconds))
+            return false;
+
+        // Reserva antes de gravar: uma falha de disco não pode abrir caminho
+        // para o motor retentar a cada 400 ms. O cooldown global entra aqui
+        // também, e não na gravação — se ficasse só na gravação, uma falha
+        // gastaria a reserva de CADA pessoa e elas ficariam um intervalo
+        // inteiro (300 s por padrão) sem conseguir entrar numa foto.
+        _lastPhotoByUser[user] = now;
+        _lastCapture = now;
+        return true;
+    }
+
+    private void LogMultiFace(List<string> resumo)
+    {
+        if (resumo.Count == 0) return;
+        DateTime now = DateTime.Now;
+        if (now - _lastMultiFaceLogAt < RankLogInterval) return;
+        _lastMultiFaceLogAt = now;
+        LoggerService.Info("[Multi] " + string.Join(" | ", resumo));
+    }
+
+    private static string DescreverRanking(IReadOnlyList<(string Name, float Cosine)> ranking) =>
+        ranking.Count == 0
+            ? "sem galeria"
+            : string.Join(", ", ranking.Take(3).Select(r => $"{r.Name}={r.Cosine:F3}"));
+
+    /// <summary>
+    /// Posição e tamanho da caixa, em porcentagem do quadro. Entra no log
+    /// multi-pessoa porque é o que distingue "têm duas pessoas na frente" de
+    /// "o detector achou a mesma cabeça duas vezes": duas caixas quase iguais
+    /// e sobrepostas são a mesma pessoa, e aí o nome certo é um só.
+    /// </summary>
+    private static string DescreverCaixa(Rect box) =>
+        $"[x={box.X:0} y={box.Y:0} {box.Width}x{box.Height}]";
+
+    /// <summary>
+    /// Aprende sozinho um rosto que não pertence a ninguém da galeria, gravando-o
+    /// no operador que o usuário acabou de escolher na tela.
+    ///
+    /// Travas, todas obrigatórias:
+    /// - o operador precisa ter sido escolhido na tela nos últimos
+    ///   <see cref="OperatorChoiceWindow"/>. Sem isso, bastaria qualquer visitante
+    ///   parar na frente da câmera para virar o dono — e o app passaria a
+    ///   reconhecê-lo como o dono daí em diante;
+    /// - o mesmo rosto tem que aparecer em <see cref="NewFaceMinHits"/> quadros
+    ///   seguidos com cosseno alto entre si, o que separa "a mesma pessoa" de
+    ///   "alguém passando";
+    /// - cooldown longo entre gravações;
+    /// - a pose ainda passa pelas mesmas travas de duplicata e de limite de
+    ///   poses das demais, e a escrita vai para a fila, nunca para o disco aqui.
+    /// </summary>
+    private void TryAutoLearnNewFace(float[] embedding, DateTime now)
+    {
+        if (!_config.FaceAutoLearnNew) return;
+        if (embedding is not { Length: > 0 }) return;
+
+        string target = _operatorChosenByUser.Length > 0 ? _operatorChosenByUser : _users.ActiveUser;
+        if (string.IsNullOrEmpty(target)) return;
+        if (_operatorChosenAt == DateTime.MinValue || now - _operatorChosenAt > OperatorChoiceWindow)
+            return;
+        if (now < _nextNewFaceEnrollAt) return;
+
+        float[]? anterior = _newFaceLastEmbedding;
+        _newFaceHits = anterior != null &&
+            CosineSimilarity(anterior, embedding) >= NewFaceStabilityCosine
+            ? _newFaceHits + 1
+            : 1;
+        _newFaceLastEmbedding = (float[])embedding.Clone();
+
+        if (_newFaceHits < NewFaceMinHits) return;
+
+        _newFaceHits = 0;
+        _newFaceLastEmbedding = null;
+        _nextNewFaceEnrollAt = now.Add(NewFaceCooldown);
+
+        EnqueueEmbeddingWrite(target, (float[])embedding.Clone());
+        LoggerService.Info(
+            $"[Auto-novo] Rosto estável sem dono salvo na galeria de '{target}' "
+            + $"({NewFaceMinHits} quadros seguidos, similaridade >= {NewFaceStabilityCosine:F2}). "
+            + "Se não era essa pessoa, apague as poses dela em 'Redefinir galeria'.");
+        StatusChanged?.Invoke($"Rosto novo aprendido em '{target}' — confira na galeria");
     }
 
     private void ProcessFaceEnrollment(
@@ -2146,6 +2490,21 @@ public sealed class CaptureEngine : IDisposable
             if (!knownUsers.Contains(oldUser, StringComparer.OrdinalIgnoreCase))
                 _lastPhotoByUser.Remove(oldUser);
         }
+
+        // A contagem de permanência é por pessoa e também depende de quem está
+        // cadastrado: um nome que saiu da galeria precisa zerar, senão a pessoa
+        // entraria na próxima foto sem confirmar de novo.
+        foreach (string saiu in _multiFaceSince.Keys
+                     .Where(k => !knownUsers.Contains(k, StringComparer.OrdinalIgnoreCase))
+                     .ToList())
+        {
+            _multiFaceSince.Remove(saiu);
+        }
+
+        // O aprendizado de rosto novo é zerado junto: uma galeria que acabou de
+        // mudar torna obsoleta a contagem de estabilidade do quadro anterior.
+        _newFaceLastEmbedding = null;
+        _newFaceHits = 0;
     }
 
     private bool FaceQualityOk(Mat frame, Rect faceRect, out string reason)
@@ -2609,8 +2968,109 @@ public sealed class CaptureEngine : IDisposable
         return canvas;
     }
 
-    private void CaptureAndSave(Mat frame, string trigger, Mat? faceFrame, Rect[] faceBoxes)
+    private static readonly string[] Meses =
     {
+        "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+        "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+    };
+
+    /// <summary>
+    /// Pasta {saida}/{Ano}/{Mês}/{Dia}. Sem o usuário no caminho: quem é a pessoa
+    /// fica no carimbo e no nome do arquivo, não na estrutura de pastas.
+    /// </summary>
+    private string DayFolderFor(DateTime now)
+    {
+        string dir = _config.OutputFolder;
+        if (string.IsNullOrEmpty(dir))
+            dir = ConfigService.DefaultOutputFolder;
+        return Path.Combine(dir, now.Year.ToString(), Meses[now.Month - 1], now.Day.ToString("00"));
+    }
+
+    private static string SafeUserName(string user)
+    {
+        string safe = string.Join("_", user.Split(Path.GetInvalidFileNameChars()));
+        return string.IsNullOrEmpty(safe) ? "usuario" : safe;
+    }
+
+    /// <summary>
+    /// Uma foto por pessoa presente no quadro. É aqui que uma pessoa vira um
+    /// arquivo: nome próprio, recorte no rosto dela e carimbo com o nome dela.
+    /// Uma falha de uma não derruba as outras.
+    /// </summary>
+    private void CaptureMultiPersonBatch(Mat frame, string trigger, Mat? faceFrame,
+        IReadOnlyList<FaceShot> shots)
+    {
+        // Nenhuma checagem de cooldown aqui: ele já foi conferido e reservado no
+        // portão de captura, uma vez para o lote inteiro. Conferir de novo
+        // descartaria a segunda pessoa só por ser a segunda.
+        DateTime now = DateTime.Now;
+
+        if (faceFrame == null || faceFrame.Empty())
+        {
+            LoggerService.Warn($"Câmera do rosto indisponível durante {trigger}; "
+                + $"{shots.Count} pessoa(s) não foram fotografadas");
+            return;
+        }
+
+        string dayDir = DayFolderFor(now);
+        try
+        {
+            Directory.CreateDirectory(dayDir);
+        }
+        catch (Exception ex)
+        {
+            LoggerService.Error("Falha ao criar pasta de fotos", ex);
+            ErrorOccurred?.Invoke("Falha ao criar pasta: " + ex.Message);
+            return;
+        }
+
+        PhotoCaptureStarted?.Invoke(trigger); // LED verde: câmera "tirando a foto"
+        LoggerService.Info(
+            $"[Multi] {shots.Count} pessoas no quadro; uma foto para cada: "
+            + string.Join(", ", shots.Select(s => s.User)));
+
+        foreach (var shot in shots)
+        {
+            try
+            {
+                string file = CreateUniquePhotoPath(dayDir, now, SafeUserName(shot.User));
+                using var composed = ComposeCaptureFrame(frame, faceFrame, new[] { shot.Box });
+                Mat imageToSave = composed ?? frame;
+                using var annotated = OverlayRenderer.Annotate(imageToSave, now, shot.User, trigger);
+                if (!Cv2.ImWrite(file, annotated))
+                {
+                    LoggerService.Error($"Falha ao gravar imagem: {file}");
+                    ErrorOccurred?.Invoke("Falha ao gravar imagem: " + file);
+                    continue;
+                }
+
+                LoggerService.Info($"Foto salva: {file} ({trigger}, {shot.User})");
+                _lastPhotoByUser[shot.User] = now;
+                Interlocked.Increment(ref _lastCaptureCount);
+                StatusChanged?.Invoke($"Foto: {Path.GetFileName(file)}");
+                PhotoCaptured?.Invoke(new CapturedPhoto(file, shot.User, now, trigger));
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Error($"Falha ao salvar foto de '{shot.User}'", ex);
+                ErrorOccurred?.Invoke("Falha ao salvar foto: " + ex.Message);
+            }
+        }
+    }
+
+    private void CaptureAndSave(Mat frame, string trigger, Mat? faceFrame, Rect[] faceBoxes,
+        IReadOnlyList<FaceShot> shots)
+    {
+        // Quadro com várias pessoas: uma foto por pessoa, cada uma com o seu
+        // nome e recortada no rosto dela. Vale inclusive quando só UMA delas
+        // passou pelos gates — nesse caso o caminho de pessoa única carimbaria
+        // com o operador ativo, que não é necessariamente quem está na frente.
+        if (shots.Count > 0 && faceBoxes.Length > 1)
+        {
+            CaptureMultiPersonBatch(frame, trigger, faceFrame, shots);
+            return;
+        }
+
         bool automaticFaceTrigger = string.Equals(trigger, "Rosto", StringComparison.OrdinalIgnoreCase);
         bool forceFace = _forceFaceInNextCapture;
         if (forceFace) _forceFaceInNextCapture = false; // Consome a flag
@@ -2643,26 +3103,11 @@ public sealed class CaptureEngine : IDisposable
 
         try
         {
-            string dir = _config.OutputFolder;
-            if (string.IsNullOrEmpty(dir))
-                dir = ConfigService.DefaultOutputFolder;
-
-            string safeUser = string.Join("_", user.Split(Path.GetInvalidFileNameChars()));
-            if (string.IsNullOrEmpty(safeUser))
-                safeUser = "usuario";
+            string safeUser = SafeUserName(user);
 
             // Pastas: {Ano} / {Mês} / {Dia} — sem o usuário no caminho (o operador
             // fica identificado no carimbo e no nome do arquivo, não na estrutura de pastas).
-            string[] meses =
-            {
-                "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
-                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
-            };
-            string dayDir = Path.Combine(
-                dir,
-                now.Year.ToString(),
-                meses[now.Month - 1],
-                now.Day.ToString("00"));
+            string dayDir = DayFolderFor(now);
             Directory.CreateDirectory(dayDir);
 
             string file = CreateUniquePhotoPath(dayDir, now, safeUser);

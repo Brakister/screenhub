@@ -92,6 +92,8 @@ public class MainForm : Form
     private NumericUpDown _numCooldown = null!;
     private CheckBox _ckFaceAutoCapture = null!;
     private CheckBox _ckFaceRequireKnown = null!;
+    private CheckBox _ckFaceMultiPerson = null!;
+    private CheckBox _ckFaceAutoLearnNew = null!;
     private NumericUpDown _numFaceConfirm = null!;
     private NumericUpDown _numFaceGrace = null!;
     private NumericUpDown _numFaceDwell = null!;
@@ -573,6 +575,26 @@ public class MainForm : Form
         gb.Controls.Add(_ckFaceRequireKnown);
         y += 27;
 
+        _ckFaceMultiPerson = NewCheck("Várias pessoas: 1 foto para cada", 12, y);
+        _ckFaceMultiPerson.CheckedChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _config.FaceMultiPerson = _ckFaceMultiPerson.Checked;
+            SaveConfig();
+        };
+        gb.Controls.Add(_ckFaceMultiPerson);
+        y += 27;
+
+        _ckFaceAutoLearnNew = NewCheck("Aprender rosto novo sozinho (só o operador escolhido)", 12, y);
+        _ckFaceAutoLearnNew.CheckedChanged += (s, e) =>
+        {
+            if (_loadingUi) return;
+            _config.FaceAutoLearnNew = _ckFaceAutoLearnNew.Checked;
+            SaveConfig();
+        };
+        gb.Controls.Add(_ckFaceAutoLearnNew);
+        y += 27;
+
         _numFaceConfirm = AddNumRow(gb, "Confirmar mesma pessoa (s):", 12, y, 0, 60, 1);
         _numFaceConfirm.ValueChanged += (s, e) =>
         {
@@ -611,6 +633,10 @@ public class MainForm : Form
             Text = "A confirmação, a troca e o intervalo são contados por pessoa. Com os padrões, " +
                    "uma troca espera 8 s e uma foto automática só ocorre após 5 s de rosto estável, " +
                    "no máximo a cada 5 min.\n" +
+                   "• Com várias pessoas, cada uma recebe o seu nome e a sua foto. Se duas forem " +
+                   "parecidas demais, o app não fotografa em vez de trocar os nomes.\n" +
+                   "• O aprendizado de rosto novo só vale logo depois de você escolher o operador " +
+                   "aqui na tela — um visitante não é aprendido sozinho.\n" +
                    "• ESPAÇO ou F9 tiram a foto com 1 s de previsão\n" +
                    "• A luz fica verde no momento da foto",
             AutoSize = true,
@@ -1759,6 +1785,8 @@ public class MainForm : Form
             _numCooldown.Value = Math.Clamp(_config.CooldownSeconds, 0, 3600);
             _ckFaceAutoCapture.Checked = _config.FaceEnabled;
             _ckFaceRequireKnown.Checked = _config.FaceCaptureRequireKnown;
+            _ckFaceMultiPerson.Checked = _config.FaceMultiPerson;
+            _ckFaceAutoLearnNew.Checked = _config.FaceAutoLearnNew;
             _numFaceConfirm.Value = Math.Clamp(_config.FaceConfirmSeconds, 0, 60);
             _numFaceGrace.Value = Math.Clamp(_config.FaceSwitchGraceSeconds, 0, 600);
             _numFaceDwell.Value = Math.Clamp(_config.FaceCaptureDwellSeconds, 0, 600);

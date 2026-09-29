@@ -93,10 +93,35 @@ Arquivo: `%APPDATA%\ScreenLab\config.json`
 | `faceEnabled` | Liga a câmera de rosto | false |
 | `faceVideoWidth/faceVideoHeight` | Resolução da câmera de rosto | 640×480 |
 | `faceIntervalMs` | Intervalo entre reconhecimentos (ms) | 400 |
+| `faceCaptureRequireKnown` | Só fotografa pessoa já cadastrada | true |
+| `faceMultiPerson` | Várias pessoas no quadro: 1 foto para cada, cada uma com o seu nome | true |
+| `faceAutoLearnNew` | Aprende sozinho um rosto novo estável no operador escolhido na tela | true |
+| `faceConfirmSeconds` | Tempo de rosto firme antes da foto (s) | 2 |
+| `faceCaptureDwellSeconds` | Tempo de rosto presente antes da foto (s) | 3 |
+| `faceCaptureCooldownSeconds` | Intervalo entre fotos da mesma pessoa (s) | 300 |
 | `outputFolder` | Pasta de destino das fotos | `...\Pictures\ScreenLab` |
 
 A pasta de fotos é criada automaticamente como
 `{nome do usuário}-{ano}\{mês}\{dia}`.
+
+### Várias pessoas no quadro
+
+Com duas ou mais pessoas na frente, o app resolve o quadro inteiro de uma vez,
+em vez de decidir rosto por rosto, porque **cada nome ocupa no máximo um rosto**.
+É a atribuição ótima (algoritmo húngaro), não a gulosa: a gulosa pode travar o
+rosto certo no nome certo e empurrar o outro para o nome errado.
+
+Cada pessoa confirmada ganha a sua própria foto, recortada e carimbada com o
+nome dela. Se duas forem parecidas demais para o app decidir com folga, ele
+**não fotografa** — trocar os nomes seria pior do que não fotografar. O
+operador ativo não é alterado nesse modo: com várias pessoas na frente, "quem é
+o operador agora" não tem resposta estável.
+
+O aprendizado de rosto novo tem trava de segurança: só acontece nos 2 minutos
+seguintes a você escolher o operador na tela, e só depois de 8 quadros seguidos
+com o mesmo rosto (similaridade ≥ 0,75 entre eles), no máximo 1 pose a cada
+10 min. Um visitante que passa na frente não é aprendido sozinho. Se entrar
+gente errada, apague com **Redefinir galeria**.
 
 ## Solução de problemas
 

@@ -29,8 +29,23 @@ public sealed class CaptureEngine : IDisposable
     private const int FacePreviewWidth = 640;
     private const int FacePreviewHeight = 480;
     private const int PreviewMinIntervalMs = 33; // ~30 fps preview
-    private const int LoopTargetMsWithPreview = 30; // ~33 fps target loop
+    private const int LoopTargetMsWithPreview = 33; // ~30 fps: o preview não pode ser mais lento que a câmera
     private const int LoopPauseMsWithoutPreview = 90; // oculto: ~10 leituras/s p/ economizar CPU
+    /// <summary>
+    /// Cadência das caixas verdes no preview do rosto. Independente do
+    /// <see cref="AppConfig.FaceIntervalMs"/>, que cronometra o RECONHECIMENTO
+    /// (YuNet + SFace, caro). Com os dois atrelados, o quadrado andava 2,5x por
+    /// segundo (400 ms) mesmo com o vídeo a 30 fps — vídeo novo com moldura
+    /// velha é exatamente a sensação de "lag".
+    /// </summary>
+    private const int FaceBoxRefreshMs = 100;
+    /// <summary>Espera máxima pelo quadro do rosto quando algo depende dele agora.</summary>
+    private const int FaceFrameWaitMs = 400;
+    /// <summary>Taxa pedida às duas webcams. 30 fps é o teto da maioria delas e
+    /// o que o app Câmera do Windows entrega.</summary>
+    private const int TargetCameraFps = 30;
+    /// <summary>Abaixo disso o preview fica visivelmente travado, então vale avisar.</summary>
+    private const int MinAcceptableCameraFps = 20;
 
     private readonly AppConfig _config;
     private readonly UserManager _users;
@@ -106,11 +121,28 @@ public sealed class CaptureEngine : IDisposable
     private VideoCapture? _capture;
     private VideoCapture? _faceCapture;
     private Thread? _thread;
+    private Thread? _faceThread;
     private CancellationTokenSource? _cts;
     private int _disposed;
 
+    // --- Pump dedicado da câmera do rosto -------------------------------------
+    // Antes as DUAS webcams eram lidas no MESMO loop, uma atrás da outra. Cada
+    // Read() do MSMF bloqueia até o próximo quadro do dispositivo (~33 ms a
+    // 30 fps), então o período do loop virava a SOMA das duas latências: o
+    // preview ia a ~15 fps e a câmera do rosto entrava sempre meio quadro
+    // atrasada. Aqui ela tem thread própria e nunca espera a principal.
+    private readonly object _faceFrameLock = new();
+    private Mat? _faceFront;   // último quadro lido, seguro para o consumidor
+    private Mat? _faceBack;    // buffer em que o pump escreve
+    private long _faceFrameSeq; // quantos quadros o pump já entregou
+    private long _faceFrameSeen; // último seq consumido pelo loop principal
+    private long _faceFrames;  // total lido (estatística de fps)
+    private volatile bool _faceThreadRunning;
+
     private readonly Stopwatch _faceWatch = Stopwatch.StartNew();
+    private readonly Stopwatch _faceBoxWatch = Stopwatch.StartNew();
     private readonly Stopwatch _previewWatch = Stopwatch.StartNew();
+    private readonly Stopwatch _facePreviewWatch = Stopwatch.StartNew();
     private DateTime _lastCapture = DateTime.MinValue;
     private DateTime _lastIntervalCapture = DateTime.MinValue;
     private DateTime _lastCameraFailLog = DateTime.MinValue;
@@ -126,6 +158,9 @@ public sealed class CaptureEngine : IDisposable
     private readonly object _statsLock = new();
     private DateTime _statsSince = DateTime.Now;
     private long _loops, _readMs, _detectMs, _saveMs, _lastCaptureCount;
+    private long _lastFaceFramesTotal;
+    private long _previewFrames;         // previews publicados na UI
+    private long _lastPreviewFramesTotal;
     private volatile string _pendingManualTrigger = "";
     private volatile bool _paused;
     private volatile bool _running;
@@ -532,6 +567,7 @@ public sealed class CaptureEngine : IDisposable
 
         _thread = new Thread(Loop) { IsBackground = true, Name = "ScreenLab.Capture" };
         _thread.Start();
+        StartFacePump();
         StartWriter();
         LoggerService.Info("Motor de captura iniciado");
         StatusChanged?.Invoke("Iniciando câmera...");
@@ -541,11 +577,13 @@ public sealed class CaptureEngine : IDisposable
     public bool Stop()
     {
         Thread? thread;
+        Thread? faceThread;
         VideoCapture? capture;
         VideoCapture? faceCapture;
         lock (_stateLock)
         {
             thread = _thread;
+            faceThread = _faceThread;
             if (!_running && (thread == null || !thread.IsAlive))
                 return true;
 
@@ -556,8 +594,16 @@ public sealed class CaptureEngine : IDisposable
             _capture = null;
             _faceCapture = null;
         }
+        _faceThreadRunning = false;
         capture?.Dispose();
         faceCapture?.Dispose();
+
+        // O pump é encerrado ANTES do Join da thread principal: ele segura o
+        // VideoCapture do rosto e o front buffer, e o loop principal depende
+        // desses dois para sair limpo.
+        if (faceThread != null && faceThread.IsAlive)
+            faceThread.Join(3000);
+        faceThread = null;
 
         bool stopped = thread == null || !thread.IsAlive || thread.Join(5000);
         if (!stopped)
@@ -577,6 +623,7 @@ public sealed class CaptureEngine : IDisposable
             _cts?.Dispose();
             _cts = null;
             _thread = null;
+            _faceThread = null;
             _frameBuf?.Dispose();
             _frameBuf = null;
             _faceFrameBuf?.Dispose();
@@ -585,6 +632,13 @@ public sealed class CaptureEngine : IDisposable
             _previewBuf = null;
             _facePreviewBuf?.Dispose();
             _facePreviewBuf = null;
+            lock (_faceFrameLock)
+            {
+                _faceFront?.Dispose();
+                _faceFront = null;
+                _faceBack?.Dispose();
+                _faceBack = null;
+            }
         }
 
         LoggerService.Info("Motor de captura parado");
@@ -617,6 +671,14 @@ public sealed class CaptureEngine : IDisposable
             _faceCapture?.Dispose();
             _faceCapture = null;
             _nextFaceCameraRetryAt = DateTime.MinValue;
+        }
+        // O quadro em mãos é da câmera antiga: descartá-lo evita um flash da
+        // câmera errada no preview logo depois da troca.
+        lock (_faceFrameLock)
+        {
+            _faceFront?.Dispose();
+            _faceFront = null;
+            _faceFrameSeq = 0;
         }
         LoggerService.Info($"Índices de câmera alterados: principal={cameraIndex}, face={faceCameraIndex}");
         StatusChanged?.Invoke($"Câmera principal: {cameraIndex} | Câmera face: {faceCameraIndex}");
@@ -744,32 +806,41 @@ public sealed class CaptureEngine : IDisposable
                     continue;
                 }
 
-                // --- LEITURA DA CÂMERA DO ROSTO (apenas quando necessário) ---
+                // --- QUADRO DA CÂMERA DO ROSTO ---------------------------------
+                // Já vem pronto da thread dedicada (ver FaceCameraLoop): não
+                // esperamos o FaceIntervalMs para ler, e não serializamos a
+                // leitura atras da principal. O throttle de 400 ms é do
+                // RECONHECIMENTO, não da leitura — atrelar os dois fazia o
+                // preview repintar o mesmo quadro 12x antes de trocar de imagem.
                 bool faceReadOk = false;
+                bool faceFrameIsNew = false;
                 Mat? faceFrame = null;
-                bool needFaceFrame = _pendingLearnFace 
-                    || string.Equals(_pendingManualTrigger, "Manual c/ Rosto", StringComparison.OrdinalIgnoreCase)
-                    || _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs;
+                bool faceFrameNeededNow = _pendingLearnFace
+                    || string.Equals(_pendingManualTrigger, "Manual c/ Rosto", StringComparison.OrdinalIgnoreCase);
 
-                if (needFaceFrame && EnsureFaceCameraOpen())
+                if (_config.FaceCameraIndex == _config.CameraIndex)
                 {
-                    if (_config.FaceCameraIndex == _config.CameraIndex)
+                    // Mesma webcam nos dois papéis: o frame da principal já é
+                    // o do rosto, sem passar pelo pump.
+                    frame.CopyTo(FaceFrameBuffer);
+                    faceFrame = FaceFrameBuffer;
+                    faceReadOk = !FaceFrameBuffer.Empty();
+                    faceFrameIsNew = faceReadOk;
+                }
+                else
+                {
+                    // Um passo atrás do pump: preview, detecção e composição
+                    // recebem sempre o quadro mais recente disponível.
+                    faceReadOk = TryTakeLatestFaceFrame(FaceFrameBuffer, faceFrameNeededNow,
+                        out long seq);
+                    if (faceReadOk)
                     {
-                        frame.CopyTo(FaceFrameBuffer);
                         faceFrame = FaceFrameBuffer;
-                        faceReadOk = !faceFrame.Empty();
-                    }
-                    else
-                    {
-                        var faceCapture = _faceCapture;
-                        if (faceCapture != null)
-                        {
-                            faceReadOk = faceCapture.Read(FaceFrameBuffer) && !FaceFrameBuffer.Empty();
-                            if (faceReadOk)
-                                faceFrame = FaceFrameBuffer;
-                            else
-                                TryDisposeFaceCapture();
-                        }
+                        // Reconhecer o mesmo quadro duas vezes não só gasta
+                        // CPU: reinicia o relógio de "a mesma pessoa está aqui há
+                        // N s" e pode gravar a mesma pose duas vezes na galeria.
+                        faceFrameIsNew = seq != _faceFrameSeen;
+                        _faceFrameSeen = seq;
                     }
                 }
                 swRead.Stop();
@@ -817,8 +888,11 @@ public sealed class CaptureEngine : IDisposable
                     }
                     fire = true;
                 }
-                // Detecção facial automática (rosto confirmado)
-                else if (faceReadOk && faceFrame != null &&
+                // Detecção facial automática (rosto confirmado). Só quando o
+                // quadro do rosto é NOVO: reprocessar a mesma imagem não só
+                // gasta CPU, como reinicia o relógio de "mesma pessoa há N s" e
+                // pode contar a mesma pose duas vezes na galeria.
+                else if (faceReadOk && faceFrameIsNew && faceFrame != null &&
                          Detect(faceFrame, out trigger, out faceBoxes, out faceLandmarks))
                 {
                     fire = true;
@@ -841,22 +915,15 @@ public sealed class CaptureEngine : IDisposable
                 }
 
                 // Atualiza caixas de rosto para a pré-visualização (independente de gatilhos).
-                // Roda a detecção no intervalo configurado para manter os quadrados verdes atualizados.
-                if (faceReadOk && faceFrame != null && _faceWatch.ElapsedMilliseconds >= _config.FaceIntervalMs)
+                // Aqui mora a diferença entre "vídeo travado" e "vídeo com a
+                // moldura parada": as caixas correm a 10 Hz, soltas do
+                // FaceIntervalMs que cronometra o reconhecimento caro. Com as
+                // duas atreladas, o preview repintava o mesmo quadro 12x antes
+                // de trocar de imagem — era disso que vinha o "lag do rosto".
+                if (faceReadOk && faceFrameIsNew && faceFrame != null &&
+                    _faceBoxWatch.ElapsedMilliseconds >= FaceBoxRefreshMs)
                 {
-                    _faceWatch.Restart();
-                    Detect(faceFrame, out _, out var previewBoxes, out var previewLandmarks);
-                    _lastFaceBoxes = previewBoxes;
-                    _lastFaceLandmarks = previewLandmarks;
-                    _lastFaceLabels = new string[previewBoxes.Length];
-                    for (int i = 0; i < previewBoxes.Length; i++)
-                        _lastFaceLabels[i] = "RECONHECENDO";
-                }
-                else
-                {
-                    // Mantém as caixas do ciclo anterior se a detecção não rodou
-                    _lastFaceBoxes = faceBoxes;
-                    _lastFaceLandmarks = faceLandmarks;
+                    RefreshFaceBoxes(faceFrame);
                 }
                 swDetect.Stop();
                 Accumulate(ref _detectMs, swDetect.ElapsedMilliseconds);
@@ -872,20 +939,34 @@ public sealed class CaptureEngine : IDisposable
                 Accumulate(ref _loops, 1);
                 ReportStatsIfDue();
 
+                // Cada preview tem o SEU relógio. Antes os dois compartilhavam
+                // um só, então a câmera do rosto era publicada no máximo na
+                // metade dos quadros da principal.
                 if (_previewWanted && _previewWatch.ElapsedMilliseconds >= PreviewMinIntervalMs)
                 {
                     _previewWatch.Restart();
                     Cv2.Resize(frame, PreviewBuffer, new Size(PreviewWidth, PreviewHeight));
                     PreviewFrame?.Invoke(PreviewBuffer);
+                    Interlocked.Increment(ref _previewFrames);
+                }
 
-                    if (faceFrame != null && !faceFrame.Empty())
-                    {
-                        Cv2.Resize(faceFrame, FacePreviewBuffer,
-                            new Size(FacePreviewWidth, FacePreviewHeight));
-                        DrawFaceOverlay(FacePreviewBuffer, _lastFaceBoxes, _lastFaceLabels,
-                            FacePreviewWidth, FacePreviewHeight);
-                        FacePreviewFrame?.Invoke(FacePreviewBuffer);
-                    }
+                // A câmera do rosto publica no RITMO DO LOOP, não no ritmo do
+                // pump. Publicar só quando o quadro é novo parece mais correto,
+                // mas com as duas pontas a 30 fps elas se batem: metade das
+                // amostras cai no mesmo quadro e a preview desce para ~15 fps.
+                // Repintar o mais recente a cada tique é o que dá movimento
+                // contínuo, e a imagem nunca é velha: o pump entrega o que tem
+                // de melhor e o loop mostra o que existe agora.
+                if (_previewWanted && faceFrame != null && !faceFrame.Empty() &&
+                    _facePreviewWatch.ElapsedMilliseconds >= PreviewMinIntervalMs)
+                {
+                    _facePreviewWatch.Restart();
+                    Cv2.Resize(faceFrame, FacePreviewBuffer,
+                        new Size(FacePreviewWidth, FacePreviewHeight));
+                    DrawFaceOverlay(FacePreviewBuffer, _lastFaceBoxes, _lastFaceLabels,
+                        FacePreviewWidth, FacePreviewHeight);
+                    FacePreviewFrame?.Invoke(FacePreviewBuffer);
+                    Interlocked.Increment(ref _previewFrames);
                 }
 
                 // --- Pacing adaptativo: só dorme o que faltar para ~30fps ---
@@ -903,6 +984,177 @@ public sealed class CaptureEngine : IDisposable
                 Thread.Sleep(1000);
             }
         }
+    }
+
+    // ------------------------------------------------- Pump da câmera do rosto
+
+    private void StartFacePump()
+    {
+        if (_faceThreadRunning) return;
+        // Quando as duas câmeras são o mesmo dispositivo físico não há segundo
+        // fluxo para bombear: o loop principal já entrega o mesmo quadro.
+        if (_config.FaceCameraIndex == _config.CameraIndex) return;
+
+        _faceThreadRunning = true;
+        _faceThread = new Thread(FaceCameraLoop)
+        {
+            IsBackground = true,
+            Name = "ScreenLab.FaceCamera",
+        };
+        _faceThread.Start();
+    }
+
+    /// <summary>
+    /// Lê da câmera do rosto em laço próprio, sem parar. Cada Read() do MSMF
+    /// bloqueia até o próximo quadro do dispositivo, então ler as duas webcams
+    /// no mesmo thread custava o dobro de tempo de ciclo — as duas previews
+    /// desciam para ~15 fps e a do rosto ainda chegava atrasada, porque ficava
+    /// sempre atrás da leitura da principal.
+    /// </summary>
+    private void FaceCameraLoop()
+    {
+        var ct = _cts?.Token ?? new CancellationToken(true);
+        var idleWatch = Stopwatch.StartNew();
+        while (!ct.IsCancellationRequested && _faceThreadRunning)
+        {
+            try
+            {
+                if (_paused)
+                {
+                    Thread.Sleep(200);
+                    continue;
+                }
+
+                // Ritmo: com a janela visível a câmera é lida sem parar, que é
+                // o que faz o preview andar a 30 fps. Oculto na bandeja não há
+                // preview para alimentar — mas o RECONHECIMENTO continua
+                // rodando (é ele que troca o operador), então o pump respira no
+                // mesmo compasso do FaceIntervalMs em vez de girar à toa.
+                bool highRate = _previewWanted || _pendingLearnFace
+                    || !string.IsNullOrEmpty(_pendingEnrollmentUser)
+                    || !string.IsNullOrEmpty(_pendingManualTrigger);
+                if (!highRate && idleWatch.ElapsedMilliseconds < Math.Max(150, _config.FaceIntervalMs))
+                {
+                    Thread.Sleep(25);
+                    continue;
+                }
+                idleWatch.Restart();
+
+                if (!EnsureFaceCameraOpen())
+                {
+                    Thread.Sleep(200);
+                    continue;
+                }
+
+                var capture = _faceCapture;
+                if (capture == null)
+                {
+                    Thread.Sleep(100);
+                    continue;
+                }
+
+                var back = _faceBack;
+                if (back == null)
+                {
+                    back = new Mat();
+                    _faceBack = back;
+                }
+
+                if (!capture.Read(back) || back.Empty())
+                {
+                    // Câmera do rosto desconectada/travada. Read() que falha
+                    // no MSMF costuma deixar o source em estado ruim: derrubar
+                    // e reabrir é o que faz ela voltar sozinha.
+                    TryDisposeFaceCapture();
+                    Thread.Sleep(300);
+                    continue;
+                }
+
+                // Troca front/back sob o lock. O consumidor copia de _faceFront
+                // também sob o lock, então nunca lê um quadro em escrita — e
+                // nunca chega atrasado, porque o que importa é o ÚLTIMO.
+                lock (_faceFrameLock)
+                {
+                    _faceBack = _faceFront;
+                    _faceFront = back;
+                    _faceFrameSeq++;
+                }
+                Interlocked.Increment(ref _faceFrames);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Encerrando; o Stop() já derrubou o VideoCapture.
+                break;
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Error("Erro no pump da câmera do rosto", ex);
+                Thread.Sleep(500);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Copia o quadro mais recente da câmera do rosto e devolve o número de
+    /// sequência dele. Com <paramref name="waitForFirst"/> maior que zero
+    /// (quando o disparo depende dele agora) espera o pump entregar o primeiro
+    /// quadro em vez de reportar "câmera indisponível" às cegas.
+    /// </summary>
+    private bool TryTakeLatestFaceFrame(Mat destination, bool waitForFirst, out long seq)
+    {
+        long deadline = Environment.TickCount64 + FaceFrameWaitMs;
+        while (true)
+        {
+            lock (_faceFrameLock)
+            {
+                var front = _faceFront;
+                if (front is not null && !front.Empty())
+                {
+                    front.CopyTo(destination);
+                    seq = _faceFrameSeq;
+                    return true;
+                }
+            }
+
+            if (!waitForFirst || Environment.TickCount64 >= deadline)
+            {
+                seq = _faceFrameSeq;
+                return false;
+            }
+            Thread.Sleep(10);
+        }
+    }
+
+    /// <summary>
+    /// Atualiza só as caixas/landmarks para o preview, sem reconhecimento.
+    /// Deixado separado do <see cref="Detect"/> porque o rótulo que o
+    /// reconhecimento produz (o nome da pessoa) é caro e não precisa correr a
+    /// 10 Hz — mas o quadrado verde precisa, senão o vídeo anda e a moldura
+    /// não, e o usuário lê isso como travamento.
+    /// </summary>
+    private void RefreshFaceBoxes(Mat frame)
+    {
+        bool detectFaces = _yunet != null || _faceCascade != null || _profileFaceCascade != null;
+        if (!detectFaces)
+        {
+            _lastFaceBoxes = Array.Empty<Rect>();
+            _lastFaceLandmarks = Array.Empty<Point2f[]>();
+            _lastFaceLabels = Array.Empty<string>();
+            return;
+        }
+
+        _faceBoxWatch.Restart();
+        (Rect[] boxes, Point2f[][] landmarks) = DetectFacesInFrame(frame);
+        _lastFaceBoxes = boxes;
+        _lastFaceLandmarks = landmarks;
+
+        // Os rótulos são propriedade do reconhecimento. Só crescem/encolhem
+        // junto com as caixas; sobrescrever aqui apagaria o nome da pessoa 10x
+        // por segundo, que era parte da leitura de "lag".
+        var labels = new string[boxes.Length];
+        for (int i = 0; i < boxes.Length; i++)
+            labels[i] = i < _lastFaceLabels.Length ? _lastFaceLabels[i] : "RECONHECENDO";
+        _lastFaceLabels = labels;
     }
 
     private bool EnsureCameraOpen()
@@ -929,23 +1181,15 @@ public sealed class CaptureEngine : IDisposable
                     continue;
                 }
 
-                // MSMF: don't force FourCC, let it negotiate (works at 1080p@30)
-                // DSHOW: force MJPG for compatibility
-                if (api == VideoCaptureAPIs.DSHOW)
-                {
-                    cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
-                }
-                cap.Set(VideoCaptureProperties.Fps, 30);
-                if (_config.VideoWidth > 0)
-                    cap.Set(VideoCaptureProperties.FrameWidth, _config.VideoWidth);
-                if (_config.VideoHeight > 0)
-                    cap.Set(VideoCaptureProperties.FrameHeight, _config.VideoHeight);
-
+                // MSMF entrega 1080p@30 como o app Câmera do Windows; deixamos
+                // o formato nativo e só negociamos taxa/resolução.
                 _capture = cap;
                 _cameraFailStreak = 0;
+                int fps = NegotiateFps(cap, api, _config.CameraIndex, "principal",
+                    _config.VideoWidth, _config.VideoHeight);
                 LoggerService.Info(
-                    $"Câmera {_config.CameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{cap.Get(VideoCaptureProperties.Fps):0}fps");
-                StatusChanged?.Invoke($"Câmera {_config.CameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
+                    $"Câmera {_config.CameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
+                StatusChanged?.Invoke($"Câmera {_config.CameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
                 return true;
             }
             catch (Exception ex)
@@ -958,6 +1202,53 @@ public sealed class CaptureEngine : IDisposable
         _cameraFailStreak++;
         LogCameraUnavailable();
         return false;
+    }
+
+    /// <summary>
+    /// Aplica o formato pedido e devolve o FPS realmente negociado.
+    /// A ordem importa: no MSMF a resolução é a troca de modo, e pedir o
+    /// frameRate depois dela é silenciosamente ignorado — o device fica no
+    /// modo antigo e o preview despenca. Por isso frameRate vem PRIMEIRO.
+    /// </summary>
+    private static int NegotiateFps(VideoCapture cap, VideoCaptureAPIs api, int index,
+        string role, int requestedWidth, int requestedHeight)
+    {
+        // DSHOW só entrega taxa decente em MJPG: em YUY2 uma 1080p passa de
+        // 30 para ~5 fps, e é o modo padrão da maioria das webcams.
+        if (api == VideoCaptureAPIs.DSHOW)
+            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
+
+        cap.Set(VideoCaptureProperties.Fps, TargetCameraFps);
+
+        // A resolução é o que realmente troca o modo do device. Vem por último
+        // e por eixo: muitos drivers re-resolvem a cada Set, e pedir largura e
+        // altura de uma vez faz o segundo ser recusado.
+        if (requestedWidth > 0)
+            cap.Set(VideoCaptureProperties.FrameWidth, requestedWidth);
+        if (requestedHeight > 0)
+            cap.Set(VideoCaptureProperties.FrameHeight, requestedHeight);
+
+        int fps = (int)Math.Round(cap.Get(VideoCaptureProperties.Fps));
+        if (fps < MinAcceptableCameraFps)
+        {
+            // Não é erro fatal, mas explica "a câmera não responde bem":
+            // o driver entregou menos que 20 fps e nenhum ajuste do app
+            // conserta isso — só trocar a câmera ou reduzir a resolução.
+            LoggerService.Warn(
+                $"Câmera {role} ({index}) negociou apenas {fps} fps via {api} "
+                + $"(pedido {TargetCameraFps}); preview pode parecer lento.");
+        }
+        // Tolerância de 16 px: o MSMF às vezes arredonda o modo para um
+        // múltiplo de 16 (620 -> 640) sem que isso signifique falha. Só uma
+        // diferença de verdade interessa, senão o aviso vira ruído no log.
+        const int widthTolerancePx = 16;
+        if (requestedWidth > 0 && Math.Abs((int)cap.FrameWidth - requestedWidth) > widthTolerancePx)
+        {
+            LoggerService.Warn(
+                $"Câmera {role} ({index}) ignorou a resolução pedida "
+                + $"({requestedWidth}x{requestedHeight}); usando {cap.FrameWidth}x{cap.FrameHeight}.");
+        }
+        return fps;
     }
 
     private bool EnsureFaceCameraOpen()
@@ -986,25 +1277,17 @@ public sealed class CaptureEngine : IDisposable
                     continue;
                 }
 
-                // MSMF: don't force FourCC, let it negotiate native format
-                // DSHOW: force MJPG for compatibility
-                if (api == VideoCaptureAPIs.DSHOW)
-                {
-                    cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
-                }
-                cap.Set(VideoCaptureProperties.Fps, 30);
-                if (_config.FaceVideoWidth > 0)
-                    cap.Set(VideoCaptureProperties.FrameWidth, _config.FaceVideoWidth);
-                if (_config.FaceVideoHeight > 0)
-                    cap.Set(VideoCaptureProperties.FrameHeight, _config.FaceVideoHeight);
-
+                // MSMF entrega o formato nativo; negociamos taxa e resolução
+                // na ordem certa (ver NegotiateFps).
                 _faceCapture = cap;
                 _faceCameraFailStreak = 0;
                 _nextFaceCameraRetryAt = DateTime.MinValue;
+                int fps = NegotiateFps(cap, api, _config.FaceCameraIndex, "rosto",
+                    _config.FaceVideoWidth, _config.FaceVideoHeight);
                 LoggerService.Info(
-                    $"Câmera do rosto {_config.FaceCameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{cap.Get(VideoCaptureProperties.Fps):0}fps");
+                    $"Câmera do rosto {_config.FaceCameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
                 StatusChanged?.Invoke(
-                    $"Câmera do rosto {_config.FaceCameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}");
+                    $"Câmera do rosto {_config.FaceCameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
                 return true;
             }
             catch (Exception ex)
@@ -1072,7 +1355,19 @@ public sealed class CaptureEngine : IDisposable
         capture?.Dispose();
     }
 
-    /// <summary>Detecção facial sobre o quadro reduzido da câmera do rosto.
+    /// <summary>Reduz o quadro e roda o detector. Usado tanto pelo caminho caro
+    /// (reconhecimento) quanto pelo rápido (só as caixas do preview).</summary>
+    private (Rect[] Faces, Point2f[][] Landmarks) DetectFacesInFrame(Mat frame)
+    {
+        using var small = new Mat();
+        using var gray = new Mat();
+        Cv2.Resize(frame, small, new Size(DetectionWidth, DetectionHeight));
+        Cv2.CvtColor(small, gray, ColorConversionCodes.BGR2GRAY);
+        Cv2.GaussianBlur(gray, gray, new Size(21, 21), 0);
+        return DetectFaces(small, gray);
+    }
+
+    /// <summary>Detecção facial + reconhecimento sobre o quadro da câmera do rosto.
     /// Atualiza caixas/landmarks sempre; retorna true só se gatilho de captura (rosto confirmado).</summary>
     private bool Detect(Mat frame, out string trigger, out Rect[] faceBoxes, out Point2f[][] faceLandmarks)
     {
@@ -1086,12 +1381,7 @@ public sealed class CaptureEngine : IDisposable
         }
 
         _faceWatch.Restart();
-        using var small = new Mat();
-        using var gray = new Mat();
-        Cv2.Resize(frame, small, new Size(DetectionWidth, DetectionHeight));
-        Cv2.CvtColor(small, gray, ColorConversionCodes.BGR2GRAY);
-        Cv2.GaussianBlur(gray, gray, new Size(21, 21), 0);
-        (faceBoxes, faceLandmarks) = DetectFaces(small, gray);
+        (faceBoxes, faceLandmarks) = DetectFacesInFrame(frame);
         _lastFaceBoxes = faceBoxes;      // Sempre atualiza para preview
         _lastFaceLandmarks = faceLandmarks;
         if (ProcessFaceRecognition(frame, faceBoxes, faceLandmarks))
@@ -1114,12 +1404,7 @@ public sealed class CaptureEngine : IDisposable
             return;
         }
 
-        using var small = new Mat();
-        using var gray = new Mat();
-        Cv2.Resize(frame, small, new Size(DetectionWidth, DetectionHeight));
-        Cv2.CvtColor(small, gray, ColorConversionCodes.BGR2GRAY);
-        Cv2.GaussianBlur(gray, gray, new Size(21, 21), 0);
-        var (boxes, landmarks) = DetectFaces(small, gray);
+        var (boxes, landmarks) = DetectFacesInFrame(frame);
         _lastFaceBoxes = boxes;
         _lastFaceLandmarks = landmarks;
         _lastFaceLabels = new string[boxes.Length];
@@ -2164,10 +2449,30 @@ public sealed class CaptureEngine : IDisposable
             double detectAvg = _loops > 0 ? _detectMs / (double)_loops : 0;
             double saveTotal = _saveMs;
 
+            // fps do rosto vem do pump (thread separada), então só aparece
+            // quando os índices são realmente diferentes.
+            long faceTotal = Interlocked.Read(ref _faceFrames);
+            long faceWindow = faceTotal - _lastFaceFramesTotal;
+            _lastFaceFramesTotal = faceTotal;
+            double faceFps = _config.FaceCameraIndex == _config.CameraIndex
+                ? loopsPerSec
+                : faceWindow / secs;
+            string faceFpsText = _config.FaceCameraIndex == _config.CameraIndex
+                ? "n/d (mesma câmera)"
+                : $"{faceFps:0.0} fps";
+
+            // fps do PREVIEW entregue à UI, que é o que o usuário enxerga.
+            long previewTotal = Interlocked.Read(ref _previewFrames);
+            long previewWindow = previewTotal - _lastPreviewFramesTotal;
+            _lastPreviewFramesTotal = previewTotal;
+            double previewFps = _previewWanted ? previewWindow / secs : 0;
+
             LoggerService.Info(
                 $"STATS: {loopsPerSec:0.0} it/s | leitura {readAvg:0.00}ms | " +
                 $"detecção {detectAvg:0.00}ms | tempo_salvando {saveTotal:0}ms | " +
-                $"fotos {_lastCaptureCount} | heap_gerenciado {GC.GetTotalMemory(false) / 1024 / 1024}MB");
+                $"fotos {_lastCaptureCount} | preview {previewFps:0.0} fps | " +
+                $"rosto {faceFpsText} | " +
+                $"heap_gerenciado {GC.GetTotalMemory(false) / 1024 / 1024}MB");
 
             _statsSince = DateTime.Now;
             _loops = _readMs = _detectMs = _saveMs = _lastCaptureCount = 0;

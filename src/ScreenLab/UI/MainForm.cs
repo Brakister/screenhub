@@ -1885,35 +1885,24 @@ public class MainForm : Form
         _led.SetIdle(Color.FromArgb(230, 45, 45)); // vermelho: não está tirando foto
     }
 
-    private void OnPreviewFrame(Mat frame)
-    {
-        if (_isHiddenToTray || IsDisposed || Disposing)
-            return;
+    // --- Preview sem fila infinita --------------------------------------------
+    // Cada quadro gerava um BeginInvoke. Se a thread de UI não acompanha — e
+    // ela não acompanha: são dois previews de ~1 MB por quadro disputando com
+    // o resto do formulário — os quadros se empilham na fila de mensagens e a
+    // tela passa a exibir imagens cada vez MAIS ANTIGAS. O preview não
+    // "congela": ele atrasa sem parar, e o usuário percebe como lag.
+    // Aqui só o quadro MAIS RECENTE fica pendente e os anteriores são
+    // descartados na hora, o que limita o atraso a no máximo um quadro.
+    private readonly object _previewSync = new();
+    private Bitmap? _pendingPreview;
+    private Bitmap? _pendingFacePreview;
+    private bool _previewPumpScheduled;
 
-        System.Drawing.Bitmap bmp;
-        try
-        {
-            bmp = MatToBitmap(frame);
-        }
-        catch
-        {
-            return;
-        }
+    private void OnPreviewFrame(Mat frame) => QueuePreview(frame, face: false);
 
-        SafeBeginInvoke(() =>
-        {
-            if (IsDisposed || Disposing)
-            {
-                bmp.Dispose();
-                return;
-            }
-            var old = _preview.Image;
-            _preview.Image = bmp;
-            old?.Dispose();
-        });
-    }
+    private void OnFacePreviewFrame(Mat frame) => QueuePreview(frame, face: true);
 
-    private void OnFacePreviewFrame(Mat frame)
+    private void QueuePreview(Mat frame, bool face)
     {
         if (_isHiddenToTray || IsDisposed || Disposing)
             return;
@@ -1928,17 +1917,92 @@ public class MainForm : Form
             return;
         }
 
-        SafeBeginInvoke(() =>
+        bool schedule;
+        lock (_previewSync)
         {
             if (IsDisposed || Disposing)
             {
                 bmp.Dispose();
                 return;
             }
-            var old = _facePreview.Image;
-            _facePreview.Image = bmp;
+            if (face)
+            {
+                _pendingFacePreview?.Dispose();
+                _pendingFacePreview = bmp;
+            }
+            else
+            {
+                _pendingPreview?.Dispose();
+                _pendingPreview = bmp;
+            }
+            schedule = !_previewPumpScheduled;
+            _previewPumpScheduled = true;
+        }
+
+        if (schedule)
+            SafeBeginInvoke(PumpPreviews);
+    }
+
+    /// <summary>
+    /// Roda na thread de UI e aplica o quadro mais recente de cada preview.
+    /// Reagenda sozinho se chegou imagem nova durante a aplicação, então
+    /// nenhum quadro fica pendurado e a taxa de repaint continua livre.
+    /// </summary>
+    private void PumpPreviews()
+    {
+        Bitmap? main = null;
+        Bitmap? face = null;
+        lock (_previewSync)
+        {
+            main = _pendingPreview;
+            _pendingPreview = null;
+            face = _pendingFacePreview;
+            _pendingFacePreview = null;
+            _previewPumpScheduled = false;
+        }
+
+        if (IsDisposed || Disposing)
+        {
+            main?.Dispose();
+            face?.Dispose();
+            return;
+        }
+
+        if (main is not null)
+        {
+            var old = _preview.Image;
+            _preview.Image = main;
             old?.Dispose();
-        });
+        }
+        if (face is not null)
+        {
+            var old = _facePreview.Image;
+            _facePreview.Image = face;
+            old?.Dispose();
+        }
+
+        bool schedule;
+        lock (_previewSync)
+        {
+            schedule = !_previewPumpScheduled
+                && (_pendingPreview is not null || _pendingFacePreview is not null);
+            if (schedule)
+                _previewPumpScheduled = true;
+        }
+        if (schedule)
+            SafeBeginInvoke(PumpPreviews);
+    }
+
+    /// <summary>Libera quadros que ficaram pendentes com a janela fechando.</summary>
+    private void DisposePendingPreviews()
+    {
+        lock (_previewSync)
+        {
+            _pendingPreview?.Dispose();
+            _pendingPreview = null;
+            _pendingFacePreview?.Dispose();
+            _pendingFacePreview = null;
+        }
     }
 
     private void OnPhotoCaptured(CapturedPhoto photo)
@@ -2113,6 +2177,7 @@ public class MainForm : Form
         _tray.Visible = false;
         _tray.Dispose();
         _engine.Dispose();
+        DisposePendingPreviews();
     }
 
     private void ExitApplication()

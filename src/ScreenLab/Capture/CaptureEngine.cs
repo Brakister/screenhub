@@ -125,6 +125,12 @@ public sealed class CaptureEngine : IDisposable
     private CancellationTokenSource? _cts;
     private int _disposed;
 
+    // Pedido de reabertura vindo de fora (troca de índice). Quem FAZ o descarte
+    // é a thread que está lendo: descartar um VideoCapture de dentro de um
+    // Read() em voo estoura ObjectDisposedException nela.
+    private volatile bool _captureNeedsReopen;
+    private volatile bool _faceCaptureNeedsReopen;
+
     // --- Pump dedicado da câmera do rosto -------------------------------------
     // Antes as DUAS webcams eram lidas no MESMO loop, uma atrás da outra. Cada
     // Read() do MSMF bloqueia até o próximo quadro do dispositivo (~33 ms a
@@ -398,11 +404,23 @@ public sealed class CaptureEngine : IDisposable
 
     private volatile bool _pendingLearnFace = false;
 
+    /// <summary>
+    /// Encerra uma tentativa de aprendizado com falha, logando o motivo.
+    /// Sem o log, "não salvou" é indistinguível de "não tentou": o operador
+    /// só via a mensagem na tela, que some em 3 segundos, e o log fica
+    /// mudo justamente nos casos que precisam de diagnóstico.
+    /// </summary>
+    private void FailLearnFace(string reason)
+    {
+        LoggerService.Warn($"[LearnFace] Não salvou: {reason}");
+        LearnFaceCompleted?.Invoke(false, reason);
+    }
+
     private void ProcessLearnCurrentFace(Mat faceFrame)
     {
         if (faceFrame == null || faceFrame.Empty())
         {
-            LearnFaceCompleted?.Invoke(false, "Câmera de rosto indisponível");
+            FailLearnFace("Câmera de rosto indisponível");
             return;
         }
 
@@ -412,19 +430,19 @@ public sealed class CaptureEngine : IDisposable
 
         if (faceBoxes.Length == 0)
         {
-            LearnFaceCompleted?.Invoke(false, "Nenhum rosto detectado na câmera");
+            FailLearnFace("Nenhum rosto detectado na câmera");
             return;
         }
         if (faceBoxes.Length > 1)
         {
-            LearnFaceCompleted?.Invoke(false, "Múltiplos rostos detectados — mostre apenas 1");
+            FailLearnFace($"Múltiplos rostos detectados ({faceBoxes.Length}) — mostre apenas 1");
             return;
         }
 
         Rect faceRect = ScaleFaceRect(faceBoxes[0], faceFrame.Width, faceFrame.Height);
         if (!FaceQualityOk(faceFrame, faceRect, out string qualityReason))
         {
-            LearnFaceCompleted?.Invoke(false, $"Qualidade ruim: {qualityReason}");
+            FailLearnFace($"Qualidade ruim: {qualityReason}");
             return;
         }
 
@@ -434,7 +452,7 @@ public sealed class CaptureEngine : IDisposable
 
         if (!TryAlignFace(crop, cropLandmarks, out Mat aligned))
         {
-            LearnFaceCompleted?.Invoke(false, "Falha ao alinhar rosto");
+            FailLearnFace("Falha ao alinhar rosto");
             return;
         }
 
@@ -443,7 +461,7 @@ public sealed class CaptureEngine : IDisposable
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
             if (embedding == null)
             {
-                LearnFaceCompleted?.Invoke(false, "Modelo de reconhecimento indisponível");
+                FailLearnFace("Modelo de reconhecimento indisponível");
                 return;
             }
 
@@ -470,7 +488,8 @@ public sealed class CaptureEngine : IDisposable
             // CommitTemplate recusa duplicata e usuário cheio sem gravar nada.
             if (!_faceRecognizer.CommitTemplate(target, embedding))
             {
-                LearnFaceCompleted?.Invoke(false, "Essa pose já está na galeria (ou o usuário está no limite)");
+                FailLearnFace($"Pose recusada para '{target}' — já está na galeria "
+                    + "ou o usuário atingiu o limite de poses");
                 return;
             }
 
@@ -485,7 +504,7 @@ public sealed class CaptureEngine : IDisposable
             else
             {
                 _faceRecognizer.RollbackTemplate(target, embedding);
-                LearnFaceCompleted?.Invoke(false, "Falha ao salvar no disco");
+                FailLearnFace($"Falha ao salvar no disco a pose de '{target}'");
             }
         }
     }
@@ -561,6 +580,10 @@ public sealed class CaptureEngine : IDisposable
             _running = true;
             _lastIntervalCapture = DateTime.Now;
             _cts = new CancellationTokenSource();
+            // Início limpo: um pedido de reabertura pendente de uma sessão
+            // anterior derrubaria a câmera que acabou de abrir.
+            _captureNeedsReopen = false;
+            _faceCaptureNeedsReopen = false;
         }
 
         ResetFaceRuntimeState();
@@ -595,18 +618,22 @@ public sealed class CaptureEngine : IDisposable
             _faceCapture = null;
         }
         _faceThreadRunning = false;
+
+        // Encerra as threads ANTES de derrubar as câmeras. Read() do MSMF
+        // bloqueia até no máximo um intervalo de quadro (~33ms a 30fps), então
+        // o Join é curto — e ordenar assim tira o descarte de cima do
+        // Read() em voo, que é a mesma corrida que SetCameraIndices tinha.
+        bool faceStopped = faceThread == null || !faceThread.IsAlive || faceThread.Join(3000);
+        bool stopped = thread == null || !thread.IsAlive || thread.Join(5000);
+
+        // Um pedido de reabertura que sobrou vira lixo aqui: as threads já
+        // morreram, então ninguém vai aplicá-lo.
+        _captureNeedsReopen = false;
+        _faceCaptureNeedsReopen = false;
         capture?.Dispose();
         faceCapture?.Dispose();
 
-        // O pump é encerrado ANTES do Join da thread principal: ele segura o
-        // VideoCapture do rosto e o front buffer, e o loop principal depende
-        // desses dois para sair limpo.
-        if (faceThread != null && faceThread.IsAlive)
-            faceThread.Join(3000);
-        faceThread = null;
-
-        bool stopped = thread == null || !thread.IsAlive || thread.Join(5000);
-        if (!stopped)
+        if (!faceStopped || !stopped)
         {
             LoggerService.Warn("A thread de captura não encerrou em 5 s; um novo início será recusado.");
             StatusChanged?.Invoke("A câmera ainda está encerrando; aguarde");
@@ -663,17 +690,26 @@ public sealed class CaptureEngine : IDisposable
         _config.CameraIndex = cameraIndex;
         _config.FaceCameraIndex = faceCameraIndex;
 
-        // Invalida as capturas atuais; o loop vai reabrir com os novos índices no próximo ciclo.
+        // Invalida as capturas atuais; o loop vai reabrir com os novos índices
+        // no próximo ciclo.
+        //
+        // O descarte é adiado para a thread que LÊ (o loop e o pump), em vez de
+        // ser feito aqui. Descartar um VideoCapture enquanto um Read() está em
+        // voo é uma corrida: pode perder a iteração em curso no loop — que é
+        // onde o aprendizado de rosto pedido pelo operador é processado. No log
+        // antigo, ObjectDisposedException aparecia sistematicamente no mesmo
+        // segundo das trocas de índice. (Um probe isolado não reproduziu a
+        // exceção neste caminho do MSMF, então isto é defesa de corrida, não
+        // reprodução do bug.)
         lock (_stateLock)
         {
-            _capture?.Dispose();
-            _capture = null;
-            _faceCapture?.Dispose();
-            _faceCapture = null;
+            _captureNeedsReopen = true;
+            _faceCaptureNeedsReopen = true;
             _nextFaceCameraRetryAt = DateTime.MinValue;
         }
         // O quadro em mãos é da câmera antiga: descartá-lo evita um flash da
-        // câmera errada no preview logo depois da troca.
+        // câmera errada no preview logo depois da troca. O pump pode estar
+        // lendo _faceBack agora, então só o front (que é só leitura) sai.
         lock (_faceFrameLock)
         {
             _faceFront?.Dispose();
@@ -1166,6 +1202,14 @@ public sealed class CaptureEngine : IDisposable
             return true;
         }
 
+        // Troca de índice pedida de fora: o descarte acontece AQUI, na thread
+        // que ia ler, e só agora que nenhum Read() está em voo.
+        if (_captureNeedsReopen)
+        {
+            _captureNeedsReopen = false;
+            TryDisposeCapture();
+        }
+
         // Try MSMF first (Media Foundation) - delivers 1080p@30fps like Windows Camera
         // Fall back to DSHOW if MSMF fails
         var apis = new[] { VideoCaptureAPIs.MSMF, VideoCaptureAPIs.DSHOW };
@@ -1261,6 +1305,16 @@ public sealed class CaptureEngine : IDisposable
             return true;
         if (DateTime.Now < _nextFaceCameraRetryAt)
             return false;
+
+        // Mesma ideia da câmera principal: quem descarta é a thread do pump,
+        // que é quem está lendo — nunca a thread de UI, que pode chamar isso
+        // com um Read() em voo.
+        if (_faceCaptureNeedsReopen)
+        {
+            _faceCaptureNeedsReopen = false;
+            TryDisposeFaceCapture();
+        }
+
 
         // Try MSMF first (Media Foundation) — better fps like Windows Camera
         // Fall back to DSHOW if MSMF fails

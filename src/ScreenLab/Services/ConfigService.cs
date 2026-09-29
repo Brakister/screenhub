@@ -415,11 +415,34 @@ public static class ConfigService
                 Directory.CreateDirectory(folder);
 
             string json = JsonSerializer.Serialize(cfg, JsonOpts);
-            temporaryPath = configPath + $".{Guid.NewGuid():N}.tmp";
-            File.WriteAllText(temporaryPath, json);
-            File.Move(temporaryPath, configPath, overwrite: true);
-            temporaryPath = null;
-            return true;
+
+            // O destino pode estar momentaneamente trancado por quem não é o app:
+            // antivírus varrendo o arquivo recém-escrito, ou o OneDrive
+            // sincronizando %APPDATA%. Nesse caso o File.Move com overwrite
+            // falha com UnauthorizedAccessException/IOException — e como cada pose
+            // salva reescreve o config inteiro, perder a corrida significa perder
+            // a pose. São milissegundos de lock, então repetir resolve.
+            const int attempts = 4;
+            for (int attempt = 1; ; attempt++)
+            {
+                temporaryPath = configPath + $".{Guid.NewGuid():N}.tmp";
+                try
+                {
+                    File.WriteAllText(temporaryPath, json);
+                    File.Move(temporaryPath, configPath, overwrite: true);
+                    temporaryPath = null;
+                    return true;
+                }
+                catch (Exception ex) when (IsTransientFileLock(ex) && attempt < attempts)
+                {
+                    TryDeleteTemporary(temporaryPath);
+                    temporaryPath = null;
+                    LoggerService.Warn(
+                        $"config.json trancado por outro processo (tentativa {attempt}/{attempts}); "
+                        + "repetindo em instantes.");
+                    Thread.Sleep(attempt * 60);
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -428,17 +451,29 @@ public static class ConfigService
         }
         finally
         {
-            if (temporaryPath != null)
-            {
-                try
-                {
-                    File.Delete(temporaryPath);
-                }
-                catch
-                {
-                    // O arquivo temporário já não participa da configuração ativa.
-                }
-            }
+            TryDeleteTemporary(temporaryPath);
+        }
+    }
+
+    /// <summary>
+    /// O lock é de terceiro e dura pouco: antivírus, indexador ou cliente de
+    /// sync. Esses dois são os que valem repetir. Qualquer outra falha
+    /// (disco cheio, caminho inválido, permissão negada de verdade) não
+    /// melhora com repetição e só deve reportar na hora.
+    /// </summary>
+    private static bool IsTransientFileLock(Exception ex) =>
+        ex is IOException or UnauthorizedAccessException;
+
+    private static void TryDeleteTemporary(string? temporaryPath)
+    {
+        if (temporaryPath == null) return;
+        try
+        {
+            File.Delete(temporaryPath);
+        }
+        catch
+        {
+            // O arquivo temporário já não participa da configuração ativa.
         }
     }
 }

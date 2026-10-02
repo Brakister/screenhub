@@ -46,13 +46,12 @@ public class MainForm : Form
     private readonly NotifyIcon _tray = new();
     private readonly ToolStripMenuItem _trayPause = new("Pausar") { CheckOnClick = false };
 
-    private bool _exiting;
     private bool _isHiddenToTray;
     private bool _loadingUi;
     private bool _hotkeysRegistered;
     private bool _countdownActive;
     private bool _settingsOpen;
-    private bool _includeFaceInPhoto = false; // Nova flag: incluir rosto na foto (tecla P)
+    private bool _includeFaceInPhoto = false; // Nova flag: incluir rosto na foto (tecla F11)
 
     // Pré-visualização
     private PictureBox _preview = null!;
@@ -345,7 +344,7 @@ public class MainForm : Form
 
         _btnToggleFaceInPhoto = new RoundedButton
         {
-            Text = "🔴 SEM ROSTO (P)",
+            Text = "🔴 SEM ROSTO (F11)",
             ButtonColor = Color.FromArgb(180, 60, 60),
             ForeColor = Color.White,
             Font = new Font(Font.FontFamily, 9.5f, FontStyle.Bold),
@@ -1312,7 +1311,7 @@ public class MainForm : Form
         {
             var hint = new Label
             {
-                Text = "Feche a janela para continuar rodando na bandeja.\nPara sair de vez, use o menu da bandeja → Sair.\nESPAÇO ou F9 = tirar foto (1 s de previsão), F8 = pausar.",
+                Text = "Fechar a janela (X) encerra o programa. Minimizar deixa rodando na bandeja.\nESPAÇO ou F9 = tirar foto (1 s de previsão), F8 = pausar,\nF10 = aprender rosto, F11 = incluir/excluir rosto na foto.",
                 AutoSize = true,
                 ForeColor = Color.DimGray,
                 Location = new Point(12, y),
@@ -1459,7 +1458,7 @@ public class MainForm : Form
         }
         if (_btnToggleFaceInPhoto != null)
         {
-            _btnToggleFaceInPhoto.Text = _includeFaceInPhoto ? "🟢 COM ROSTO (P)" : "🔴 SEM ROSTO (P)";
+            _btnToggleFaceInPhoto.Text = _includeFaceInPhoto ? "🟢 COM ROSTO (F11)" : "🔴 SEM ROSTO (F11)";
             _btnToggleFaceInPhoto.ButtonColor = _includeFaceInPhoto
                 ? Color.FromArgb(0, 140, 60)
                 : Color.FromArgb(180, 60, 60);
@@ -1878,7 +1877,7 @@ public class MainForm : Form
             UpdateEnrollmentCaptureButton(false);
             UpdateEnrollmentUi();
             ApplyStatus($"Rosto cadastrado: {name}");
-            MessageBox.Show(this, $"As 5 poses de {name} foram cadastradas com sucesso.",
+            MessageBox.Show(this, $"As poses de {name} foram cadastradas com sucesso.",
                 "Reconhecimento facial", MessageBoxButtons.OK, MessageBoxIcon.Information);
         });
         _engine.FaceEnrollmentProgress += (name, count, total, prompt, seconds) => SafeBeginInvoke(() =>
@@ -1901,6 +1900,20 @@ public class MainForm : Form
             _led.SetIdle(Color.FromArgb(230, 45, 45)); // vermelho: sem captura
         });
         _engine.LearnFaceCompleted += (success, message) => SafeBeginInvoke(() => OnLearnFaceCompleted(success, message));
+        // Sem esta assinatura, qualquer caminho que cancela o cadastro (falha ao
+        // gravar, timeout, modelo indisponível) deixava o botão preso em
+        // "Concluindo..." para sempre, sem nenhum caminho de volta.
+        _engine.FaceEnrollmentCanceled += (name, reason) => SafeBeginInvoke(() =>
+        {
+            _enrollmentUser = "";
+            _btnEnrollFace.Enabled = true;
+            _btnEnrollFace.Text = "Iniciar cadastro guiado";
+            UpdateEnrollmentCaptureButton(false);
+            UpdateEnrollmentUi();
+            ApplyStatus($"Cadastro facial cancelado: {reason}");
+            MessageBox.Show(this, $"O cadastro facial de {name} foi cancelado.\n\n{reason}",
+                "Reconhecimento facial", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        });
     }
 
     private void ApplyStatus(string status)
@@ -2132,7 +2145,7 @@ public class MainForm : Form
             return;
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_CAPTURE, MOD_NOREPEAT, (uint)Keys.F9);
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_PAUSE, MOD_NOREPEAT, (uint)Keys.F8);
-        _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_FACE_IN_PHOTO, MOD_NOREPEAT, (uint)Keys.P);
+        _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_FACE_IN_PHOTO, MOD_NOREPEAT, (uint)Keys.F11);
         _hotkeysRegistered = RegisterHotKey(Handle, HOTKEY_ID_LEARN_FACE, MOD_NOREPEAT, (uint)Keys.F10);
     }
 
@@ -2189,12 +2202,6 @@ public class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (!_exiting)
-        {
-            e.Cancel = true;
-            HideToTray();
-            return;
-        }
         base.OnFormClosing(e);
     }
 
@@ -2210,7 +2217,6 @@ public class MainForm : Form
 
     private void ExitApplication()
     {
-        _exiting = true;
         Close();
         Application.Exit();
     }

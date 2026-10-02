@@ -308,7 +308,11 @@ public class UserManager
 
     private static bool IsUsableEmbedding(float[]? embedding)
     {
-        if (embedding is not { Length: 128 })
+        // Não fixa a dimensão: o app aceita SFace (128-d) e ArcFace (512-d), e
+        // trocar de modelo não pode invalidar o que o reconhecedor produziu.
+        // Só interessam o tamanho mínimo (vetor utilizável) e o máximo (JSON
+        // razoável) — o valor exato é problema do FaceRecognizerService.
+        if (embedding is not { Length: > 0 and <= 4096 })
             return false;
 
         double sumSquares = 0;

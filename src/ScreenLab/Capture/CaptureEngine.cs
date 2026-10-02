@@ -39,6 +39,42 @@ public sealed class CaptureEngine : IDisposable
     /// velha é exatamente a sensação de "lag".
     /// </summary>
     private const int FaceBoxRefreshMs = 100;
+    /// <summary>
+    /// Quando o YuNet rodou pela última vez neste processo. Serve para o
+    /// <see cref="RefreshFaceBoxes"/> não repetir a inferência que o
+    /// <see cref="Detect"/> acabou de fazer no mesmo quadro.
+    /// </summary>
+    private long _lastDetectAtMs;
+    /// <summary>Caixas usadas na última rodada de reconhecimento (espaço da detecção).</summary>
+    private Rect[] _lastRecognizedFaces = Array.Empty<Rect>();
+    /// <summary>Quando o reconhecimento rodou de verdade pela última vez.</summary>
+    private long _lastRecognitionAtMs;
+
+    /// <summary>
+    /// Threads que o OpenCV/DNN pode usar. Medido nesta máquina (i3-1220P,
+    /// 12 threads lógicos): o ArcFace gasta 135 ms por inferência usando as 12
+    /// e 228 ms usando 4. Rodar com todas parece mais rápido no papel, mas o
+    /// laço de captura precisa de CPU para ler as webcams a 30 fps — e ele é
+    /// quem desenha o preview. Deixar folga para a captura vale muito mais que
+    /// ganhar 90 ms numa inferência que só acontece 2,5x por segundo.
+    /// </summary>
+    private const int DnnWorkerThreads = 4;
+
+    /// <summary>
+    /// Quanto a caixa do rosto pode andar, em pixels, entre duas rodadas de
+    /// reconhecimento sem que a pessoa seja considerada "a mesma de sempre".
+    /// Abaixo disso a pose é a mesma e o embedding também seria — pagar 135 ms
+    /// para gerar o mesmo número de novo não muda nada na tela.
+    /// </summary>
+    private const int FaceStillnessTolerancePx = 12;
+
+    /// <summary>
+    /// Teto do intervalo sem reconhecimento quando ninguém se mexe e a
+    /// identidade já está confirmada. Passado esse tempo o app reavalia de
+    /// qualquer jeito: é o que garante que os cooldowns continuem andando e que
+    /// uma troca de pessoa (que muda a geometria) nunca passe batido.
+    /// </summary>
+    private const int FaceSettledStillnessMaxMs = 3000;
     /// <summary>Espera máxima pelo quadro do rosto quando algo depende dele agora.</summary>
     private const int FaceFrameWaitMs = 400;
     /// <summary>Taxa pedida às duas webcams. 30 fps é o teto da maioria delas e
@@ -56,8 +92,30 @@ public sealed class CaptureEngine : IDisposable
     private volatile bool _pendingEnrollmentCapture;
     private string _enrollmentSessionUser = "";
     private readonly List<float[]> _enrollmentSamples = new();
+    /// <summary>
+    /// Assinatura de pose de cada amostra aceita, paralela a _enrollmentSamples.
+    /// É comparada com a captura anterior para decidir se a pose MUDOU de verdade.
+    /// </summary>
+    private readonly List<HeadPose?> _enrollmentPoses = new();
     private const int EnrollmentSampleCount = 10;
-    private const float EnrollmentDuplicateSimilarity = 0.97f;
+    /// <summary>
+    /// Quanto a geometria da cabeça precisa mudar (em unidades de distância entre
+    /// os olhos) para a nova captura valer como pose diferente, mesmo que o
+    /// embedding do reconhecimento continue parecido. O ArcFace é invariante à
+    /// pose de propósito: virar o rosto quase não mexe no cosseno, então olhar o
+    /// cosseno para detectar "virei a cara" é medir a coisa errada. A geometria
+    /// dos marcos do YuNet, essa sim, muda quando a cabeça vira.
+    /// </summary>
+    private const float PoseVariationThreshold = 0.10f;
+    /// <summary>
+    /// Cosseno acima do qual a captura é tratada como o MESMO quadro da anterior.
+    /// Não é um constante: o valor certo depende do modelo (ver
+    /// FaceRecognizerService.EnrollmentDuplicateSimilarity). Ele é só o guarda
+    /// contra repetir a captura sem sair do lugar — quem mede "a pose mudou" é a
+    /// geometria dos marcos (<see cref="ComputeHeadPose"/>), porque o cosseno do
+    /// ArcFace quase não muda quando a cabeça vira.
+    /// </summary>
+    private float EnrollmentDuplicateSimilarity => _faceRecognizer.EnrollmentDuplicateSimilarity;
     private static readonly string[] EnrollmentPrompts =
     {
         "OLHE DE FRENTE", "VIRE PARA A ESQUERDA", "VIRE PARA A DIREITA",
@@ -188,6 +246,13 @@ public sealed class CaptureEngine : IDisposable
     private readonly object _statsLock = new();
     private DateTime _statsSince = DateTime.Now;
     private long _loops, _readMs, _detectMs, _saveMs, _lastCaptureCount;
+    /// <summary>
+    /// Pior tempo de detecção na janela. A média de <see cref="_detectMs"/> não
+    /// serve para achar travamento: o reconhecimento caro roda a cada N quadros,
+    /// então a média se dilui em ~30 ms enquanto a rodada de verdade custa
+    /// 135 ms por rosto. O usuário percebe o pico, não a média.
+    /// </summary>
+    private long _detectMaxMs;
     private long _lastFaceFramesTotal;
     private long _previewFrames;         // previews publicados na UI
     private long _lastPreviewFramesTotal;
@@ -219,8 +284,14 @@ public sealed class CaptureEngine : IDisposable
     {
         _config = config;
         _users = users;
+
+        // O DNN do OpenCV usa todos os núcleos por padrão e sufoca os laços de
+        // captura, que são quem mantém o preview em 30 fps. Ver
+        // <see cref="DnnWorkerThreads"/> para os números medidos.
+        Cv2.SetNumThreads(DnnWorkerThreads);
+
         string modelPath = Path.Combine(AppContext.BaseDirectory, "Data", "models",
-            "face_recognition_sface_2021dec.onnx");
+            "arcfaceresnet100-8.onnx");
         _faceRecognizer = new FaceRecognizerService(modelPath);
         _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
         _users.UsersChanged += ReloadFaceGallery;
@@ -237,6 +308,31 @@ public sealed class CaptureEngine : IDisposable
             _yunet = null;
             LoggerService.Warn($"Detector YuNet não carregou: {ex.Message}");
         }
+
+        // O reconhecedor tem centenas de MB. Carregá-lo aqui, na thread que vai
+        // abrir a câmera, empurrava a abertura das duas câmeras para segundos
+        // depois — o usuário via "lento" antes mesmo de a câmera ligar. Uma
+        // thread dedicada resolve: a câmera abre na hora e o modelo fica
+        // pronto antes da primeira inferência.
+        var preload = new Thread(() =>
+        {
+            try
+            {
+                _faceRecognizer.Preload();
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Warn($"Pré-carregamento do modelo falhou: {ex.Message}");
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ScreenLab.ModelPreload",
+            // Abaixo do normal: é trabalho de fundo e não pode competir com a
+            // thread que está abrindo a câmera.
+            Priority = ThreadPriority.BelowNormal,
+        };
+        preload.Start();
     }
 
     public bool IsRunning => _running;
@@ -542,6 +638,7 @@ public sealed class CaptureEngine : IDisposable
         _pendingEnrollmentReset = false;
         _enrollmentSessionUser = "";
         _enrollmentSamples.Clear();
+        _enrollmentPoses.Clear();
         _lastEnrollmentPrompt = "";
         _enrollmentStartedAt = DateTime.MinValue;
     }
@@ -672,6 +769,7 @@ public sealed class CaptureEngine : IDisposable
         // Espera a fila de embeddings drenar antes de derrubar o motor: uma
         // pose já em memória e ainda não gravada se perderia no restart.
         StopWriter();
+        StopDuplicateShotWriter();
 
         lock (_stateLock)
         {
@@ -995,6 +1093,7 @@ public sealed class CaptureEngine : IDisposable
                 }
                 swDetect.Stop();
                 Accumulate(ref _detectMs, swDetect.ElapsedMilliseconds);
+                TrackMax(ref _detectMaxMs, swDetect.ElapsedMilliseconds);
 
                 if (fire)
                 {
@@ -1108,6 +1207,18 @@ public sealed class CaptureEngine : IDisposable
                 }
                 idleWatch.Restart();
 
+                // As duas webcams não devem ser abertas ao mesmo tempo. O
+                // Media Foundation serializa a enumeração de dispositivos: as
+                // duas threads disputando o mesmo lock global faziam a
+                // principal demorar ~24 s e a do rosto mais de um minuto.
+                // Abrir em sequência dá o mesmo resultado com metade do tempo.
+                if (_config.FaceCameraIndex != _config.CameraIndex &&
+                    _capture?.IsOpened() != true)
+                {
+                    Thread.Sleep(100);
+                    continue;
+                }
+
                 if (!EnsureFaceCameraOpen())
                 {
                     Thread.Sleep(200);
@@ -1211,16 +1322,36 @@ public sealed class CaptureEngine : IDisposable
             return;
         }
 
+        // O Detect acabou de rodar o YuNet neste MESMO quadro e deixou as
+        // caixas em _lastFaceBoxes/_lastFaceLandmarks. Rodar o detector de novo
+        // aqui custava uma inferência a cada 100 ms sem produzir nada novo —
+        // era a maior fatia da CPU do laço. Só detecta se ninguém passou por
+        // lá desde a última atualização.
+        long sinceDetect = Environment.TickCount64 - _lastDetectAtMs;
+        if (_lastDetectAtMs != 0 && sinceDetect < FaceBoxRefreshMs)
+        {
+            _faceBoxWatch.Restart();
+            PreserveLabelsForExistingBoxes();
+            return;
+        }
+
         _faceBoxWatch.Restart();
+        _lastDetectAtMs = Environment.TickCount64;
         (Rect[] boxes, Point2f[][] landmarks) = DetectFacesInFrame(frame);
         _lastFaceBoxes = boxes;
         _lastFaceLandmarks = landmarks;
+        PreserveLabelsForExistingBoxes();
+    }
 
-        // Os rótulos são propriedade do reconhecimento. Só crescem/encolhem
-        // junto com as caixas; sobrescrever aqui apagaria o nome da pessoa 10x
-        // por segundo, que era parte da leitura de "lag".
-        var labels = new string[boxes.Length];
-        for (int i = 0; i < boxes.Length; i++)
+    /// <summary>
+    /// Os rótulos são propriedade do reconhecimento. Só crescem/encolhem junto
+    /// com as caixas; sobrescrevê-los aqui apagaria o nome da pessoa 10x por
+    /// segundo, que era parte da leitura de "lag".
+    /// </summary>
+    private void PreserveLabelsForExistingBoxes()
+    {
+        var labels = new string[_lastFaceBoxes.Length];
+        for (int i = 0; i < labels.Length; i++)
             labels[i] = i < _lastFaceLabels.Length ? _lastFaceLabels[i] : "RECONHECENDO";
         _lastFaceLabels = labels;
     }
@@ -1242,14 +1373,19 @@ public sealed class CaptureEngine : IDisposable
             TryDisposeCapture();
         }
 
-        // Try MSMF first (Media Foundation) - delivers 1080p@30fps like Windows Camera
-        // Fall back to DSHOW if MSMF fails
-        var apis = new[] { VideoCaptureAPIs.MSMF, VideoCaptureAPIs.DSHOW };
+        // DSHOW primeiro, MSMF como reserva. Medido nesta máquina: DSHOW abre a
+        // webcam em ~1,9 s contra ~8 s do MSMF, e entrega a MESMA 1920x1080@30
+        // (o MSMF só ganha algo quando a câmera não tem MJPG). O MSMF paga esse
+        // tempo porque sobe a pilha inteira do Media Foundation para enumerar
+        // dispositivos. A ordem antiga (MSMF primeiro) custava ~22 s de espera
+        // na tela e mais de um minuto até a segunda câmera.
+        var apis = new[] { VideoCaptureAPIs.DSHOW, VideoCaptureAPIs.MSMF };
 
         foreach (var api in apis)
         {
             try
             {
+                var openWatch = Stopwatch.StartNew();
                 var cap = new VideoCapture(_config.CameraIndex, api);
                 if (!cap.IsOpened())
                 {
@@ -1264,7 +1400,9 @@ public sealed class CaptureEngine : IDisposable
                 int fps = NegotiateFps(cap, api, _config.CameraIndex, "principal",
                     _config.VideoWidth, _config.VideoHeight);
                 LoggerService.Info(
-                    $"Câmera {_config.CameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
+                    $"Câmera {_config.CameraIndex} aberta via {api} em "
+                    + $"{cap.FrameWidth}x{cap.FrameHeight}@{fps}fps "
+                    + $"(levou {openWatch.ElapsedMilliseconds} ms)");
                 StatusChanged?.Invoke($"Câmera {_config.CameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
                 return true;
             }
@@ -1282,27 +1420,34 @@ public sealed class CaptureEngine : IDisposable
 
     /// <summary>
     /// Aplica o formato pedido e devolve o FPS realmente negociado.
-    /// A ordem importa: no MSMF a resolução é a troca de modo, e pedir o
-    /// frameRate depois dela é silenciosamente ignorado — o device fica no
-    /// modo antigo e o preview despenca. Por isso frameRate vem PRIMEIRO.
+    ///
+    /// A ordem é o que decide se a câmera é rápida ou não. Medido nesta
+    /// máquina, mesma webcam 1080p, mesmo backend DSHOW:
+    ///   FourCC -> fps -> w -> h : driver ignora o MJPG, fica em YUY2 e a
+    ///                           câmera entrega 2 fps (frame de ~3 MB por
+    ///                           imagem; era o "app não respondendo").
+    ///   fps -> w -> h -> FourCC : MJPG é respeitado, 25 fps a 1920x1080.
+    /// Ou seja: no DSHOW a resolução é a troca de modo, e cada Set de
+    /// resolução RESETA a compressão. O FourCC tem que vir DEPOIS.
     /// </summary>
     private static int NegotiateFps(VideoCapture cap, VideoCaptureAPIs api, int index,
         string role, int requestedWidth, int requestedHeight)
     {
-        // DSHOW só entrega taxa decente em MJPG: em YUY2 uma 1080p passa de
-        // 30 para ~5 fps, e é o modo padrão da maioria das webcams.
-        if (api == VideoCaptureAPIs.DSHOW)
-            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
-
         cap.Set(VideoCaptureProperties.Fps, TargetCameraFps);
 
-        // A resolução é o que realmente troca o modo do device. Vem por último
-        // e por eixo: muitos drivers re-resolvem a cada Set, e pedir largura e
-        // altura de uma vez faz o segundo ser recusado.
+        // A resolução é o que realmente troca o modo do device. Vem por eixo:
+        // muitos drivers re-resolvem a cada Set, e pedir largura e altura de uma
+        // vez faz o segundo ser recusado.
         if (requestedWidth > 0)
             cap.Set(VideoCaptureProperties.FrameWidth, requestedWidth);
         if (requestedHeight > 0)
             cap.Set(VideoCaptureProperties.FrameHeight, requestedHeight);
+
+        // MJPG é obrigatório para a taxa de entrega. Em YUY2 a 1080p a câmera
+        // não passa de 2 fps, com ou sem as duas webcams ligadas. Vai por último
+        // de propósito — ver o comentário do método.
+        if (api == VideoCaptureAPIs.DSHOW)
+            cap.Set(VideoCaptureProperties.FourCC, VideoWriter.FourCC('M', 'J', 'P', 'G'));
 
         int fps = (int)Math.Round(cap.Get(VideoCaptureProperties.Fps));
         if (fps < MinAcceptableCameraFps)
@@ -1324,7 +1469,35 @@ public sealed class CaptureEngine : IDisposable
                 $"Câmera {role} ({index}) ignorou a resolução pedida "
                 + $"({requestedWidth}x{requestedHeight}); usando {cap.FrameWidth}x{cap.FrameHeight}.");
         }
+
+        // A compressão negotiate é a causa número um de "a câmera não
+        // responde". Registrar no log é o que permite descobrir isso sem
+        // ter que adivinhar: em YUY2 a mesma 1080p cai para ~2 fps.
+        if (api == VideoCaptureAPIs.DSHOW)
+        {
+            string fourCc = FourCcToString(cap);
+            if (fourCc != "MJPG")
+            {
+                LoggerService.Warn(
+                    $"Câmera {role} ({index}) ficou em {fourCc}, não em MJPG. "
+                    + "A compressão foi recusada pelo driver e a taxa de quadros "
+                    + "fica muito abaixo do esperado.");
+            }
+        }
         return fps;
+    }
+
+    private static string FourCcToString(VideoCapture cap)
+    {
+        try
+        {
+            int value = (int)cap.Get(VideoCaptureProperties.FourCC);
+            return new string(BitConverter.GetBytes(value).Select(b => (char)b).ToArray());
+        }
+        catch
+        {
+            return "?";
+        }
     }
 
     private bool EnsureFaceCameraOpen()
@@ -1348,14 +1521,15 @@ public sealed class CaptureEngine : IDisposable
         }
 
 
-        // Try MSMF first (Media Foundation) — better fps like Windows Camera
-        // Fall back to DSHOW if MSMF fails
-        var apis = new[] { VideoCaptureAPIs.MSMF, VideoCaptureAPIs.DSHOW };
+        // Mesma ordem da principal: DSHOW abre em ~1,9 s contra ~8 s do MSMF
+        // e dá a mesma 640x480@30. Ver comentário em EnsureCameraOpen.
+        var apis = new[] { VideoCaptureAPIs.DSHOW, VideoCaptureAPIs.MSMF };
 
         foreach (var api in apis)
         {
             try
             {
+                var openWatch = Stopwatch.StartNew();
                 var cap = new VideoCapture(_config.FaceCameraIndex, api);
                 if (!cap.IsOpened())
                 {
@@ -1371,7 +1545,9 @@ public sealed class CaptureEngine : IDisposable
                 int fps = NegotiateFps(cap, api, _config.FaceCameraIndex, "rosto",
                     _config.FaceVideoWidth, _config.FaceVideoHeight);
                 LoggerService.Info(
-                    $"Câmera do rosto {_config.FaceCameraIndex} aberta via {api} em {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
+                    $"Câmera do rosto {_config.FaceCameraIndex} aberta via {api} em "
+                    + $"{cap.FrameWidth}x{cap.FrameHeight}@{fps}fps "
+                    + $"(levou {openWatch.ElapsedMilliseconds} ms)");
                 StatusChanged?.Invoke(
                     $"Câmera do rosto {_config.FaceCameraIndex}: {cap.FrameWidth}x{cap.FrameHeight}@{fps}fps");
                 return true;
@@ -1469,6 +1645,7 @@ public sealed class CaptureEngine : IDisposable
         }
 
         _faceWatch.Restart();
+        _lastDetectAtMs = Environment.TickCount64;
         (faceBoxes, faceLandmarks) = DetectFacesInFrame(frame);
         _lastFaceBoxes = faceBoxes;      // Sempre atualiza para preview
         _lastFaceLandmarks = faceLandmarks;
@@ -1661,6 +1838,29 @@ public sealed class CaptureEngine : IDisposable
     private DateTime _lastRankLogAt = DateTime.MinValue;
     private static readonly TimeSpan RankLogInterval = TimeSpan.FromSeconds(3);
 
+    // --- Diagnóstico da segunda caixa (rosto duplicado) ------------------------
+    // Quando o app vê o MESMO rosto duas vezes no quadro (reflexo/preview), é
+    // impossível saber só pelo log de onde vem a segunda imagem. Um quadro
+    // anotado resolve em 2 segundos. Mas gravar o PNG 640x480 na thread da
+    // câmera derruba o preview (medido: 12 fps, picos de 587 ms), então a
+    // captura só reduz e anota uma imagem pequena; o encode/write sai numa
+    // thread própria, no máximo uma a cada 10 s, com teto por execução e
+    // mantendo só as últimas.
+    private DateTime _lastDuplicateShotAt = DateTime.MinValue;
+    private static readonly TimeSpan DuplicateShotInterval = TimeSpan.FromSeconds(10);
+    private const int DuplicateShotKeep = 30;
+    /// <summary>
+    /// Quantos snapshots o app tira por execução. É só para descobrir O QUE é a
+    /// segunda imagem; meia dúzia basta. Depois disso o diagnóstico fica inerte e
+    /// não toca mais em CPU nem em disco.
+    /// </summary>
+    private int _duplicateShotBudget = 3;
+    private readonly object _duplicateShotLock = new();
+    private readonly AutoResetEvent _duplicateShotSignal = new(false);
+    private Mat? _pendingDuplicateShot;
+    private Thread? _duplicateShotThread;
+    private volatile bool _duplicateShotRunning;
+
     /// <summary>
     /// Registra periodicamente como o rosto da frente está se comparando com
     /// cada galeria. Sem isso, "ele chamou eu de Ailton" não tem como ser
@@ -1764,12 +1964,36 @@ public sealed class CaptureEngine : IDisposable
     private readonly record struct FaceShot(string User, Rect Box, int FaceIndex);
 
     /// <summary>
+    /// A cena (as caixas dos rostos) está suficientemente igual à da última
+    /// rodada de reconhecimento, e essa rodada foi recente. Serve para não
+    /// pagar o ArcFace de novo por um embedding que seria idêntico.
+    /// </summary>
+    private bool FaceSceneUnchanged(Rect[] faces, int maxAgeMs)
+    {
+        if (faces.Length != _lastRecognizedFaces.Length) return false;
+        if (Environment.TickCount64 - _lastRecognitionAtMs >= maxAgeMs) return false;
+
+        for (int i = 0; i < faces.Length; i++)
+        {
+            Rect antes = _lastRecognizedFaces[i];
+            Rect agora = faces[i];
+            if (Math.Abs(agora.X - antes.X) > FaceStillnessTolerancePx ||
+                Math.Abs(agora.Y - antes.Y) > FaceStillnessTolerancePx ||
+                Math.Abs(agora.Width - antes.Width) > FaceStillnessTolerancePx ||
+                Math.Abs(agora.Height - antes.Height) > FaceStillnessTolerancePx)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Decide o que fazer com os rostos do quadro. Devolve as pessoas que
     /// liberaram todos os gates de captura; lista vazia = nenhuma foto.
     /// </summary>
     private List<FaceShot> ProcessFaceRecognition(Mat frame, Rect[] faces, Point2f[][] landmarks)
     {
-        _lastFaceLabels = new string[faces.Length];
         DateTime now = DateTime.Now;
         var shots = new List<FaceShot>();
 
@@ -1786,6 +2010,29 @@ public sealed class CaptureEngine : IDisposable
                 $"O cadastro ficou {EnrollmentTimeoutSeconds / 60} minutos sem receber poses e foi encerrado.");
             enrollmentUser = "";
         }
+
+        // Cena parada: ninguém se mexeu desde a última rodada e ela é recente,
+        // então o resultado seria idêntico. Cada rodada custa ~135 ms de ArcFace
+        // POR ROSTO e roda no laço de captura — era isso que fazia o preview
+        // cair para 12 fps e a janela piscar "não respondendo".
+        //
+        // O teto depende do estado: com a identidade JÁ CONFIRMADA não há nada
+        // a decidir, então reavaliar a cada 3 s basta (o operador fica parado em
+        // frente à câmera por minutos; re-inferir 2,5x por segundo era trabalho
+        // jogado fora). Enquanto a identidade não está firme — ou durante um
+        // cadastro, que exige poses novas o tempo todo — vale o ritmo cheio do
+        // FaceIntervalMs, senão a confirmação e o cadastro ficariam lentos.
+        bool settled = !string.IsNullOrEmpty(_confirmedUser) &&
+                       string.IsNullOrEmpty(enrollmentUser);
+        int stillnessBudget = settled
+            ? FaceSettledStillnessMaxMs
+            : Math.Max(_config.FaceIntervalMs, 1);
+        if (faces.Length > 0 && FaceSceneUnchanged(faces, stillnessBudget))
+            return shots;
+
+        _lastRecognizedFaces = faces;
+        _lastRecognitionAtMs = Environment.TickCount64;
+        _lastFaceLabels = new string[faces.Length];
 
         if (faces.Length == 0)
         {
@@ -1919,6 +2166,189 @@ public sealed class CaptureEngine : IDisposable
     }
 
     /// <summary>
+    /// Descarta caixas que são o MESMO rosto detectado duas vezes. O caso que
+    /// motivou isto é a câmera enxergando o próprio preview na tela ou um
+    /// reflexo: o rosto "de volta" tem embedding quase idêntico ao real (0,96 a
+    /// 0,99 nos logs), enquanto duas pessoas ficam em ~0,3. Com duas pessoas na
+    /// galeria, a atribuição distribuía os nomes pelas duas caixas e o reflexo
+    /// do operador saía carimbado com o nome do colega — exatamente o
+    /// "reconheceu outra pessoa junto comigo".
+    /// </summary>
+    private void SuppressDuplicateFaces(Mat frame, Rect[] rects, float[][] embeddings,
+        bool[] validos, List<IReadOnlyList<(string Name, float Cosine)>> rankings)
+    {
+        if (rects.Length < 2) return;
+        float limite = _faceRecognizer.DuplicateFaceSimilarity;
+
+        for (int i = 0; i < validos.Length; i++)
+        {
+            if (!validos[i]) continue;
+
+            for (int j = i + 1; j < validos.Length; j++)
+            {
+                if (!validos[j]) continue;
+
+                float cos = FaceRecognizerService.Similarity(embeddings[i], embeddings[j]);
+                if (cos < limite) continue;
+
+                // Fica a caixa MAIOR. Num reflexo ou no preview da tela o rosto
+                // "de volta" é sempre o menor dos dois.
+                int areaI = rects[i].Width * rects[i].Height;
+                int areaJ = rects[j].Width * rects[j].Height;
+                int descartar = areaI >= areaJ ? j : i;
+                int manter = descartar == j ? i : j;
+
+                validos[descartar] = false;
+                rankings[descartar] = Array.Empty<(string, float)>();
+                _lastFaceLabels[descartar] = "MESMO ROSTO (ignorado)";
+                LoggerService.Info(
+                    $"[Multi] rosto #{descartar} tem cosseno {cos:F3} com #{manter}: "
+                    + "mesmo rosto, ignorado (reflexo/preview na tela).");
+                QueueDuplicateDebugShot(frame, rects[descartar], rects[manter], cos);
+
+                if (descartar == i) break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Prepara um quadro anotado quando o mesmo rosto aparece duas vezes. A caixa
+    /// verde é a que o app manteve (maior) e a vermelha é a descartada — olhando
+    /// a foto dá para dizer na hora de onde vem a segunda imagem (tela, espelho,
+    /// detector). Aqui só reduz e desenha; a gravação vai para
+    /// <see cref="DuplicateShotLoop"/>. Escreve em %APPDATA%\ScreenLab\debug.
+    /// </summary>
+    private void QueueDuplicateDebugShot(Mat frame, Rect discard, Rect keep, float cosine)
+    {
+        if (Volatile.Read(ref _duplicateShotBudget) <= 0) return;
+
+        DateTime now = DateTime.Now;
+        if (now - _lastDuplicateShotAt < DuplicateShotInterval) return;
+        _lastDuplicateShotAt = now;
+        Interlocked.Decrement(ref _duplicateShotBudget);
+
+        try
+        {
+            // Reduz e anota aqui (barato): o que segue para a thread de gravação
+            // é uma imagem pequena, não o quadro inteiro.
+            const int width = 480;
+            double scale = width / (double)frame.Width;
+            int height = Math.Max(1, (int)Math.Round(frame.Height * scale));
+            var small = new Mat();
+            try
+            {
+                Cv2.Resize(frame, small, new Size(width, height));
+                Cv2.Rectangle(small, ScaleRect(keep, scale), new Scalar(0, 255, 0), 2, LineTypes.AntiAlias);
+                Cv2.Rectangle(small, ScaleRect(discard, scale), new Scalar(0, 0, 255), 2, LineTypes.AntiAlias);
+                Cv2.PutText(small, $"mesmo rosto cos={cosine:F3}", new Point(6, 18),
+                    HersheyFonts.HersheySimplex, 0.5, new Scalar(0, 255, 0), 1, LineTypes.AntiAlias);
+            }
+            catch
+            {
+                small.Dispose();
+                throw;
+            }
+
+            lock (_duplicateShotLock)
+            {
+                _pendingDuplicateShot?.Dispose();   // ainda não gravado: descarta
+                _pendingDuplicateShot = small;
+            }
+            StartDuplicateShotWriter();
+            _duplicateShotSignal.Set();
+        }
+        catch (Exception ex)
+        {
+            LoggerService.Warn($"Falha ao preparar diagnóstico de rosto duplicado: {ex.Message}");
+        }
+    }
+
+    private static Rect ScaleRect(Rect rect, double scale) => new(
+        (int)Math.Round(rect.X * scale),
+        (int)Math.Round(rect.Y * scale),
+        Math.Max(1, (int)Math.Round(rect.Width * scale)),
+        Math.Max(1, (int)Math.Round(rect.Height * scale)));
+
+    private void StartDuplicateShotWriter()
+    {
+        if (_duplicateShotRunning) return;
+        _duplicateShotRunning = true;
+        _duplicateShotThread = new Thread(DuplicateShotLoop)
+        {
+            IsBackground = true,
+            Name = "ScreenLab.debug-shot",
+        };
+        _duplicateShotThread.Start();
+    }
+
+    private void DuplicateShotLoop()
+    {
+        while (_duplicateShotRunning)
+        {
+            try
+            {
+                Mat? shot;
+                lock (_duplicateShotLock)
+                {
+                    shot = _pendingDuplicateShot;
+                    _pendingDuplicateShot = null;
+                }
+
+                if (shot == null)
+                {
+                    _duplicateShotSignal.WaitOne(500);
+                    continue;
+                }
+
+                using (shot)
+                {
+                    string folder = Path.Combine(ConfigService.AppDataFolder, "debug");
+                    Directory.CreateDirectory(folder);
+                    string file = Path.Combine(folder, $"dup_{DateTime.Now:yyyyMMdd_HHmmss}.jpg");
+                    Cv2.ImWrite(file, shot, new ImageEncodingParam(ImwriteFlags.JpegQuality, 70));
+                    PruneDuplicateShots(folder);
+                    LoggerService.Info($"[Debug] rosto duplicado salvo em {file}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Warn($"Falha ao salvar diagnóstico de rosto duplicado: {ex.Message}");
+            }
+        }
+    }
+
+    private void StopDuplicateShotWriter()
+    {
+        _duplicateShotRunning = false;
+        _duplicateShotSignal.Set();
+        _duplicateShotThread?.Join(1500);
+        _duplicateShotThread = null;
+
+        lock (_duplicateShotLock)
+        {
+            _pendingDuplicateShot?.Dispose();
+            _pendingDuplicateShot = null;
+        }
+    }
+
+    private static void PruneDuplicateShots(string folder)
+    {
+        try
+        {
+            var files = Directory.GetFiles(folder, "dup_*");
+            if (files.Length <= DuplicateShotKeep) return;
+
+            Array.Sort(files, StringComparer.Ordinal);
+            for (int i = 0; i < files.Length - DuplicateShotKeep; i++)
+            {
+                try { File.Delete(files[i]); }
+                catch { /* arquivo em uso: tenta de novo no próximo */ }
+            }
+        }
+        catch { /* faxina é melhor esforço */ }
+    }
+
+    /// <summary>
     /// Resolve quem é quem quando há mais de uma pessoa no quadro.
     ///
     /// O nome de cada rosto sai de <see cref="FaceAssignment.Assign"/>, que
@@ -1982,6 +2412,7 @@ public sealed class CaptureEngine : IDisposable
 
         // 2) Uma resolução para o quadro inteiro. Nada de decidir rosto por
         //    rosto: a decisão precisa enxergar quem está ao lado.
+        SuppressDuplicateFaces(frame, rects, embeddings, validos, rankings);
         var atribuidos = FaceAssignment.Assign(rankings);
 
         // 3) Rótulo e foto de cada rosto.
@@ -2213,6 +2644,7 @@ public sealed class CaptureEngine : IDisposable
         {
             _enrollmentSessionUser = user;
             _enrollmentSamples.Clear();
+            _enrollmentPoses.Clear();
             _lastEnrollmentPrompt = "";
             FaceEnrollmentProgress?.Invoke(user, 0, EnrollmentSampleCount, EnrollmentPrompts[0], 0);
         }
@@ -2247,6 +2679,8 @@ public sealed class CaptureEngine : IDisposable
             return;
         }
 
+        HeadPose? pose = ComputeHeadPose(cropLandmarks);
+
         using (aligned)
         {
             float[]? embedding = _faceRecognizer.EmbedFace(aligned);
@@ -2256,12 +2690,34 @@ public sealed class CaptureEngine : IDisposable
                 return;
             }
 
-            // Cinco quadros da mesma pose não melhoram a galeria. Pedimos uma
-            // pose realmente diferente antes de avançar, tornando o cadastro
-            // menos frágil a luz, distância e pequeno desalinhamento.
-            if (_enrollmentSamples.Any(sample => CosineSimilarity(sample, embedding) >=
-                    EnrollmentDuplicateSimilarity))
+            // Repetir a MESMA pose não melhora a galeria, então pedimos uma pose
+            // diferente antes de avançar. A comparação é só contra a última pose
+            // aceita, e não contra todas.
+            //
+            // O cosseno sozinho NÃO serve para isso: o ArcFace é invariante à
+            // pose de propósito — é justamente o que faz ele reconhecer a mesma
+            // pessoa de ângulos diferentes —, então virar a cabeça mantém o
+            // cosseno em 0,90+ e o cadastro recusava quem tinha virado de fato.
+            // Quem mede a virada é a geometria dos marcos (yaw/pitch), calculada
+            // antes do alinhamento. Só recusamos quando a pose geométrica está
+            // parada E o embedding é praticamente o mesmo quadro.
+            float cosine = _enrollmentSamples.Count > 0
+                ? (float)CosineSimilarity(_enrollmentSamples[^1], embedding)
+                : -1f;
+            bool poseChanged = pose is { } current && _enrollmentPoses.Count > 0 &&
+                _enrollmentPoses[^1] is { } previous &&
+                PoseDifference(previous, current) >= PoseVariationThreshold;
+            bool sameFrame = _enrollmentSamples.Count > 0 &&
+                cosine >= EnrollmentDuplicateSimilarity;
+
+            if (_enrollmentSamples.Count > 0 && sameFrame && !poseChanged)
             {
+                float poseDelta = pose is { } cp && _enrollmentPoses.Count > 0 &&
+                    _enrollmentPoses[^1] is { } pp ? PoseDifference(pp, cp) : -1f;
+                LoggerService.Info(
+                    $"[Cadastro] pose recusada para '{user}': poseDelta={poseDelta:F3} "
+                    + $"(corte {PoseVariationThreshold:F2}), cosseno={cosine:F3} "
+                    + $"(corte {EnrollmentDuplicateSimilarity:F2})");
                 _lastEnrollmentPrompt = "";
                 _lastFaceLabels[0] = "VARIE MAIS A POSE";
                 FaceEnrollmentProgress?.Invoke(user, sampleIndex, EnrollmentSampleCount, "VARIE MAIS A POSE", 0);
@@ -2269,6 +2725,7 @@ public sealed class CaptureEngine : IDisposable
             }
 
             _enrollmentSamples.Add(embedding);
+            _enrollmentPoses.Add(pose);
             _lastFaceLabels[0] = $"CADASTRANDO {_enrollmentSamples.Count}/{EnrollmentSampleCount}";
             FaceEnrollmentProgress?.Invoke(
                 user, _enrollmentSamples.Count, EnrollmentSampleCount, "OK", 0);
@@ -2278,18 +2735,39 @@ public sealed class CaptureEngine : IDisposable
                 return;
             }
 
-            if (!_users.SaveFaceTemplates(user, new List<float[]>(_enrollmentSamples)))
+            // A partir daqui a UI já mostra "Concluindo...". Qualquer falha —
+            //inclusive uma exceção inesperada — precisa terminar em um evento,
+            // senão o botão fica travado sem volta.
+            bool saved;
+            try
+            {
+                saved = _users.SaveFaceTemplates(user, new List<float[]>(_enrollmentSamples));
+            }
+            catch (Exception ex)
+            {
+                LoggerService.Error($"Falha inesperada ao salvar cadastro de '{user}'", ex);
+                saved = false;
+            }
+
+            if (!saved)
             {
                 _lastFaceLabels[0] = "FALHA AO SALVAR CADASTRO";
-                // Sem isso a UI ficaria esperando um evento de conclusão que
-                // nunca viria, com o botão travado em "Concluindo...".
                 CancelFaceEnrollment("Não foi possível gravar o cadastro em disco.");
                 return;
             }
             _pendingEnrollmentUser = "";
             _pendingEnrollmentCapture = false;
             ResetEnrollmentSession();
-            _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
+            try
+            {
+                _faceRecognizer.ResetGallery(_users.FaceTemplateSetsSnapshot());
+            }
+            catch (Exception ex)
+            {
+                // O cadastro já está em disco: uma falha ao recarregar a
+                // galeria não pode desfazer o sucesso nem prender a UI.
+                LoggerService.Error($"Falha ao recarregar galeria após cadastro de '{user}'", ex);
+            }
             _lastFaceLabels[0] = "CADASTRADO: " + user;
             FaceEnrollmentCompleted?.Invoke(user);
         }
@@ -2582,6 +3060,66 @@ public sealed class CaptureEngine : IDisposable
         return converted;
     }
 
+    /// <summary>
+    /// Assinatura geométrica da pose da cabeça, tirada dos 5 marcos do YuNet
+    /// (olho direito, olho esquerdo, nariz, canto direito e esquerdo da boca).
+    /// É o que permite detectar "a pessoa virou a cara" sem depender do
+    /// embedding, que de propósito não muda com a pose.
+    /// </summary>
+    private readonly struct HeadPose
+    {
+        public HeadPose(float yaw, float pitch)
+        {
+            Yaw = yaw;
+            Pitch = pitch;
+        }
+
+        /// <summary>Nariz deslocado do meio dos olhos, em distâncias entre olhos.</summary>
+        public float Yaw { get; }
+
+        /// <summary>Nariz fora do meio entre a linha dos olhos e a da boca.</summary>
+        public float Pitch { get; }
+    }
+
+    private static HeadPose? ComputeHeadPose(Point2f[]? landmarks)
+    {
+        if (landmarks is not { Length: 5 })
+            return null;
+
+        Point2f rightEye = landmarks[0];
+        Point2f leftEye = landmarks[1];
+        Point2f nose = landmarks[2];
+        Point2f rightMouth = landmarks[3];
+        Point2f leftMouth = landmarks[4];
+
+        float dx = leftEye.X - rightEye.X;
+        float dy = leftEye.Y - rightEye.Y;
+        float eyeDistance = (float)Math.Sqrt(dx * dx + dy * dy);
+        if (eyeDistance < 2f)
+            return null;
+
+        float eyeMidX = (rightEye.X + leftEye.X) * 0.5f;
+        float eyeMidY = (rightEye.Y + leftEye.Y) * 0.5f;
+        float mouthMidY = (rightMouth.Y + leftMouth.Y) * 0.5f;
+
+        // Yaw: de frente o nariz fica no meio dos olhos; ao virar ele desloca
+        // para o lado para o qual a cabeça aponta.
+        float yaw = (nose.X - eyeMidX) / eyeDistance;
+        // Pitch: de frente o nariz fica perto do meio entre os olhos e a boca;
+        // inclinando a cabeça ele sobe ou desce em relação a esse meio.
+        float noseToEye = nose.Y - eyeMidY;
+        float noseToMouth = mouthMidY - nose.Y;
+        float pitch = (noseToEye - noseToMouth) / eyeDistance;
+        return new HeadPose(yaw, pitch);
+    }
+
+    private static float PoseDifference(HeadPose a, HeadPose b)
+    {
+        float dy = a.Yaw - b.Yaw;
+        float dp = a.Pitch - b.Pitch;
+        return (float)Math.Sqrt(dy * dy + dp * dp);
+    }
+
     private static bool TryAlignFace(Mat face, Point2f[]? landmarks, out Mat aligned)
     {
         aligned = new Mat();
@@ -2845,6 +3383,18 @@ public sealed class CaptureEngine : IDisposable
     private static void Accumulate(ref long field, long value)
         => Interlocked.Add(ref field, value);
 
+    /// <summary>Guarda o maior valor já visto no campo (para achar picos, não médias).</summary>
+    private static void TrackMax(ref long field, long value)
+    {
+        long current = Interlocked.Read(ref field);
+        while (value > current)
+        {
+            long observed = Interlocked.CompareExchange(ref field, value, current);
+            if (observed == current) break;
+            current = observed;
+        }
+    }
+
     /// <summary>Heartbeat de saúde/desempenho: relatório a cada 15 s no log.</summary>
     private void ReportStatsIfDue()
     {
@@ -2882,13 +3432,15 @@ public sealed class CaptureEngine : IDisposable
 
             LoggerService.Info(
                 $"STATS: {loopsPerSec:0.0} it/s | leitura {readAvg:0.00}ms | " +
-                $"detecção {detectAvg:0.00}ms | tempo_salvando {saveTotal:0}ms | " +
+                $"detecção {detectAvg:0.00}ms (pior {_detectMaxMs}ms) | " +
+                $"tempo_salvando {saveTotal:0}ms | " +
                 $"fotos {_lastCaptureCount} | preview {previewFps:0.0} fps | " +
                 $"rosto {faceFpsText} | " +
                 $"heap_gerenciado {GC.GetTotalMemory(false) / 1024 / 1024}MB");
 
             _statsSince = DateTime.Now;
             _loops = _readMs = _detectMs = _saveMs = _lastCaptureCount = 0;
+            _detectMaxMs = 0;
         }
     }
 
@@ -3170,6 +3722,7 @@ public sealed class CaptureEngine : IDisposable
             return;
         }
         _writeSignal.Dispose();
+        _duplicateShotSignal.Dispose();
         _faceRecognizer.Dispose();
         _yunet?.Dispose();
     }

@@ -30,6 +30,48 @@ public sealed class FaceRecognizerService : IDisposable
     private float _minimumCosine = 0.42f;
     private float _minimumMargin = 0.15f;
     private float _selfSimilarityFactor = 0.80f;
+    /// <summary>
+    /// Acima deste cosseno uma pose é considerada repetição da que já existe e o
+    /// cadastro a recusa. Ciente do modelo: o SFace e o ArcFace têm escalas
+    /// diferentes e um corte único faz o cadastro não terminar num ou no outro.
+    /// </summary>
+    private float _enrollmentDuplicateSimilarity = 0.90f;
+
+    /// <summary>
+    /// Cosseno acima do qual dois rostos DETECTADOS NO MESMO QUADRO são a mesma
+    /// pessoa. Existe por causa de um caso muito comum e muito confuso: a câmera
+    /// enxerga o próprio preview na tela (ou um reflexo no vidro), e o rosto
+    /// "de volta" recebe um embedding quase idêntico ao real — medido entre
+    /// 0,96 e 0,99 nos logs. Duas PESSOAS de verdade ficam em ~0,3, então 0,90
+    /// separa os dois casos com folga. Sem esta checagem, com duas pessoas na
+    /// galeria a atribuição dava um nome para cada caixa e o reflexo do
+    /// operador saía carimbado com o nome do colega.
+    /// </summary>
+    private float _duplicateFaceSimilarity = 0.90f;
+
+    /// <summary>Corte de "é o mesmo rosto" entre duas caixas do mesmo quadro.</summary>
+    public float DuplicateFaceSimilarity
+    {
+        get
+        {
+            lock (_lock) { EnsureLoadedLocked(); return _duplicateFaceSimilarity; }
+        }
+    }
+
+    /// <summary>
+    /// Cosseno entre dois embeddings (ambos já L2-normalizados). Público para o
+    /// motor de captura poder comparar duas caixas entre si.
+    /// </summary>
+    public static float Similarity(float[] a, float[] b) => Cosine(a, b);
+
+    /// <summary>Corte de pose repetida para o modelo carregado.</summary>
+    public float EnrollmentDuplicateSimilarity
+    {
+        get
+        {
+            lock (_lock) { EnsureLoadedLocked(); return _enrollmentDuplicateSimilarity; }
+        }
+    }
 
     /// <summary>Teto de poses por pessoa. Espelha UserManager.MaxFaceTemplatesPerUser.</summary>
     public const int MaxPosesPerUser = 100;
@@ -73,6 +115,17 @@ public sealed class FaceRecognizerService : IDisposable
     public FaceRecognizerService(string modelPath)
     {
         _modelPath = modelPath;
+    }
+
+    /// <summary>
+    /// Carrega o modelo fora da thread de captura. O ArcFace tem ~248 MB e
+    /// leva segundos para entrar: sem isto, o primeiro <see cref="EmbedFace"/>
+    /// era quem pagava a conta, congelando o preview e fazendo a janela parecer
+    /// travada bem depois de as câmeras já terem aberto.
+    /// </summary>
+    public void Preload()
+    {
+        lock (_lock) { EnsureLoadedLocked(); }
     }
 
     /// <summary>True quando o modelo carregou e dá pra reconhecer.</summary>
@@ -207,17 +260,25 @@ public sealed class FaceRecognizerService : IDisposable
             }
 
             float worstIntraAll = worstIntra.Count > 0 ? worstIntra.Values.Min() : 0f;
-            bool safe = _minimumCosine > worstInter;
+
+            // O corte que vale NA PRÁTICA é o adaptativo
+            // (piorMatchDaMesmaPessoa * fator), não o piso _minimumCosine.
+            // Diagnosticar contra o piso dava "seguro" numa galeria que trocava
+            // os nomes, porque o piso raramente é o que decide.
+            float effectiveFloor = Math.Max(
+                _minimumCosine,
+                worstIntraAll * _selfSimilarityFactor);
+            bool safe = effectiveFloor > worstInter;
             float gap = worstIntraAll - worstInter;
             bool wideGap = gap >= 2f * _minimumMargin;
 
             string verdict = users.Count < 2
                 ? "so uma pessoa na galeria: nao ha confusao possivel"
                 : !safe
-                    ? $"ATENCAO: limiar {_minimumCosine:F3} esta ABAIXO do pior caso entre pessoas diferentes ({worstInter:F3}). Uma pessoa pode ser identificada como a outra."
+                    ? $"ATENCAO: corte efetivo {effectiveFloor:F3} esta ABAIXO do pior caso entre pessoas diferentes ({worstInter:F3}). Uma pessoa pode ser identificada como a outra. Cadastre mais poses de cada um para abrir a separacao."
                     : wideGap
-                        ? $"limiar {_minimumCosine:F3} esta acima do pior caso entre pessoas diferentes ({worstInter:F3})"
-                        : $"limiar ok, mas a folga e curta: pior match de quem e {worstIntraAll:F3} contra pior vicio de {worstInter:F3}, folga de {gap:F3}. Com margem minima de {_minimumMargin:F3}, varios casos ficam no limite e o app pode responder DESCONHECIDO onde antes acertava.";
+                        ? $"corte efetivo {effectiveFloor:F3} acima do pior caso entre pessoas diferentes ({worstInter:F3})"
+                        : $"corte ok, mas a folga e curta: pior match de quem e {worstIntraAll:F3} contra pior vizinho de {worstInter:F3}, folga de {gap:F3}. Com margem minima de {_minimumMargin:F3}, varios casos ficam no limite e o app pode responder DESCONHECIDO onde antes acertava.";
 
             return new GalleryDiagnostic(
                 users.Sum(u => u.Value.Count), worstIntraAll, worstInter, safe, verdict);
@@ -576,10 +637,25 @@ public sealed class FaceRecognizerService : IDisposable
                 _embeddingDim = 512;
                 _inputScale = 1.0f / 127.5f;  // normaliza para [-1, 1]
                 _inputMean = new Scalar(127.5, 127.5, 127.5);
-                _minimumCosine = 0.45f;       // ArcFace tem cossenos maiores
-                _minimumMargin = 0.08f;
+                _minimumCosine = 0.45f;       // piso absoluto; raramente decide sozinho
+                // Mesma lição já aplicada ao SFFace: com margem 0,08 o ArcFace
+                // aceita diferenças que ele não sabe resolver e troca os nomes
+                // quando duas pessoas estão no quadro. Em dúvida é melhor
+                // responder DESCONHECIDO do que escrever a foto com o nome errado.
+                _minimumMargin = 0.15f;
                 _selfSimilarityFactor = 0.85f;
-                LoggerService.Info($"Modelo ArcFace detectado (512-d): {_modelPath}");
+                // O ArcFace entrega cosseno alto até entre poses bem diferentes:
+                // medido 0,953 de pior par na galeria do Victor. Ele é invariante
+                // à pose DE PROPÓSITO, então este cosseno não mede "virou a
+                // cabeça" — quem mede isso agora é a geometria dos marcos do
+                // YuNet (ver CaptureEngine.HeadPose). Aqui o corte só pega o caso
+                // degenerado de capturar o MESMO quadro duas vezes: 0,96 deixa
+                // passar mudança de expressão (sorriso, olhos fechados) e recusa
+                // a repetição literal.
+                _enrollmentDuplicateSimilarity = 0.96f;
+                LoggerService.Info(
+                    $"Modelo ArcFace detectado (512-d): limiar={_minimumCosine:F2}, "
+                    + $"margem={_minimumMargin:F2}, pose duplicada>= {_enrollmentDuplicateSimilarity:F2}");
             }
             else if (outputDim == 128)
             {
@@ -601,6 +677,10 @@ public sealed class FaceRecognizerService : IDisposable
                 // melhor não saber do que errar o nome de quem entra.
                 _minimumMargin = 0.15f;
                 _selfSimilarityFactor = 0.80f;
+                // No SFace, poses da mesma pessoa ficam entre 0,64 (ângulo bem
+                // diferente) e 0,93 (mesmo ângulo). 0,90 separa "mesmo ângulo de
+                // novo" de "ângulo novo de verdade" sem fechar o cadastro.
+                _enrollmentDuplicateSimilarity = 0.90f;
                 LoggerService.Info($"Modelo SFace detectado (128-d): {_modelPath}");
             }
             else

@@ -10,15 +10,15 @@ Gera **um `.exe` só** em `publish\` — é esse arquivo que vai para o GitHub
 Release e para o computador que vai rodar 24/7 (não precisa de .NET instalado).
 
 O `ScreenLab.csproj` já traz `PublishSingleFile`, `SelfContained` e
-`IncludeAllContentForSelfExtract`, então os modelos ONNX e as haarcascades vão
-embutidos **dentro** do exe. Quem baixar só o `.exe` tem a detecção facial
-funcionando.
+`IncludeAllContentForSelfExtract`, então os modelos ONNX (detector YuNet +
+reconhecimento ArcFace, ~249 MB) e as haarcascades vão embutidos **dentro** do
+exe. Quem baixar só o `.exe` tem a detecção facial funcionando.
 
 ```powershell
 dotnet publish src\ScreenLab\ScreenLab.csproj -c Release -r win-x64 --self-contained true -o publish
 ```
 
-Saída: `publish\ScreenLab.exe` (~146 MB).
+Saída: `publish\ScreenLab.exe` (~352 MB).
 
 ## Gerar o instalador
 Precisa do [Inno Setup 6](https://jrsoftware.org/isinfo.php). O script lê o
@@ -52,6 +52,10 @@ gh release create v1.4.0 `
 
 ## Diagnóstico
 Log diário em `%APPDATA%\ScreenLab\logs\ScreenLab_aaaaMMdd.log`. A cada
-janela de 10 s sai uma linha `STATS` com iterações/s, média de leitura,
-detecção, tempo salvando, **fps do preview** e **fps da câmera do rosto** —
-esses dois últimos são os que acusam câmera travada.
+janela de 15 s sai uma linha `STATS` com iterações/s, média de leitura,
+detecção (e o **pior** caso da janela), tempo salvando, **fps do preview** e
+**fps da câmera do rosto** — esses dois últimos são os que acusam câmera travada.
+
+A média de `detecção` não serve para achar travamento: o reconhecimento caro roda
+de vez em quando, então a média se dilui e some. Olhe o `(pior NNN ms)`: é ele
+que mostra o congelamento que o operador vê.

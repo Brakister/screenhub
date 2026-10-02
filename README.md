@@ -18,8 +18,8 @@ para os operadores acompanharem a pré-visualização em tempo real.
   `Pasta\NomeUsuário-AAAA\Mês\Dia\foto.jpg`.
 - ✅ **Pré-visualização a ~30 fps** na janela.
 - ✅ **Inicia com o Windows** — opção na tela ou no menu da bandeja.
-- ✅ **Bandeja do sistema** — fechar a janela continua rodando em segundo plano
-  (opcional; por padrão a janela fica aberta para os operadores).
+- ✅ **Fechar encerra de vez** — clicar no **X** fecha o programa. Só o
+  **minimizar** manda para a bandeja, onde a captura continua.
 - ✅ **Logs** — em `%APPDATA%\ScreenLab\logs` (um arquivo por dia).
 - ✅ **Configuração** — em `%APPDATA%\ScreenLab\config.json`.
 
@@ -30,7 +30,8 @@ para os operadores acompanharem a pré-visualização em tempo real.
 3. Deixe a janela visível e oriente a câmera para o local desejado.
 4. Para fotografar: **botão verde "TIRAR FOTO"** ou tecla **ESPAÇO** — aparece o
    "1" na tela e a foto é tirada 1 segundo depois (LED verde no momento).
-5. Para encerrar de vez: menu da bandeja → **Sair**.
+5. Para encerrar de vez: clique no **X** da janela. (Minimizar apenas manda o
+   app para a bandeja e a captura continua.)
 
 Fotos ficam em `%USERPROFILE%\Pictures\ScreenLab` por padrão
 (configurável na tela), organizadas em
@@ -43,6 +44,8 @@ Fotos ficam em `%USERPROFILE%\Pictures\ScreenLab` por padrão
 | `ESPAÇO`   | Tirar foto (com 1 s de previsão) |
 | `F9`       | Tirar foto (global, funciona até sem foco na janela) |
 | `F8`       | Pausar / Retomar |
+| `F10`      | Aprender o rosto que está na frente da câmera |
+| `F11`      | Incluir / excluir o rosto na foto (liga e desliga o recorte do rosto) |
 
 ## Estrutura do projeto
 
@@ -55,9 +58,14 @@ src\ScreenLab\
 │   ├── UserManager.cs         → usuários pré-definidos + usuário ativo
 │   └── WindowsStartupService.cs → registro "iniciar com Windows"
 ├── Capture\
-│   ├── CaptureEngine.cs       → thread de captura + leitura da câmera
+│   ├── CaptureEngine.cs       → thread de captura + leitura da câmera + reconhecimento
 │   ├── OverlayRenderer.cs     → carimbo data/hora + usuário
 │   └── CapturedPhoto.cs       → modelo da foto capturada
+├── Recognition\
+│   └── FaceRecognizerService.cs → embeddings faciais (ArcFace) + galeria
+├── Data\models\
+│   ├── face_detection_yunet_2023mar.onnx → detector de rosto
+│   └── arcfaceresnet100-8.onnx           → reconhecimento (512-d)
 └── UI\
     ├── MainForm.cs            → janela principal + LED + bandeja
     ├── LedControl.cs          → luz de status (vermelho/verde)
@@ -76,9 +84,10 @@ dotnet build src\ScreenLab\ScreenLab.csproj -c Release
 dotnet publish src\ScreenLab\ScreenLab.csproj -c Release -r win-x64 --self-contained true -o publish
 ```
 
-Sai **um `.exe` só** em `publish\ScreenLab.exe` (~146 MB), com os modelos
-embutidos dentro. Copie esse arquivo para o computador destino e rode.
-Para gerar o instalador `.exe` de fato, veja [BUILD.md](BUILD.md).
+Sai **um `.exe` só** em `publish\ScreenLab.exe` (~352 MB), com os modelos
+embutidos dentro (a maior parte é o modelo ArcFace, ~249 MB). Copie esse arquivo
+para o computador destino e rode. Para gerar o instalador `.exe` de fato, veja
+[BUILD.md](BUILD.md).
 
 ## Ajustes rápidos (config.json)
 
@@ -104,6 +113,21 @@ Arquivo: `%APPDATA%\ScreenLab\config.json`
 A pasta de fotos é criada automaticamente como
 `{nome do usuário}-{ano}\{mês}\{dia}`.
 
+### Reconhecimento facial
+
+- **Detector:** YuNet (`face_detection_yunet_2023mar.onnx`), que acha o rosto e
+  os 5 pontos de referência.
+- **Reconhecimento:** ArcFace (`arcfaceresnet100-8.onnx`, embedding 512-d), com
+  o rosto alinhado pelos pontos antes de gerar o vetor.
+- **Galeria:** até 10 poses por pessoa. O cadastro guia as poses na tela; uma
+  pose igual à anterior é recusada com "VARIE MAIS A POSE" (as poses só precisam
+  **mudar** em relação à captura anterior; variação leve já basta).
+- **Onde estão os modelos:** embutidos no `.exe`. A galeria fica no
+  `config.json` (um vetor de 512 números por pose).
+- **Custo:** cada reconhecimento leva ~70-250 ms nesta classe de CPU. Por isso o
+  app só reavalia quando a cena muda: com a identidade já confirmada e ninguém se
+  mexendo, ele reavalia a cada 3 s em vez de 2,5 vezes por segundo.
+
 ### Várias pessoas no quadro
 
 Com duas ou mais pessoas na frente, o app resolve o quadro inteiro de uma vez,
@@ -123,6 +147,13 @@ com o mesmo rosto (similaridade ≥ 0,75 entre eles), no máximo 1 pose a cada
 10 min. Um visitante que passa na frente não é aprendido sozinho. Se entrar
 gente errada, apague com **Redefinir galeria**.
 
+Antes de atribuir os nomes, o app descarta caixas que são **o mesmo rosto duas
+vezes** no quadro (cosseno ≥ 0,90 entre elas). Isso acontece quando a câmera
+enxerga o próprio preview na tela ou um reflexo no vidro: o rosto "de volta" é
+quase idêntico ao real, e sem esse descarte o app dava um nome para cada caixa —
+o operador saía carimbado também com o nome do colega. O rosto maior é o que
+fica; o menor (o reflexo) é ignorado.
+
 ## Solução de problemas
 
 - **"Câmera X indisponível"** — verifique conexão/drivers e teste outro índice
@@ -133,6 +164,15 @@ gente errada, apague com **Redefinir galeria**.
   no mesmo hub USB 2.0 saturam a banda — a de rosto deve ficar em 640×480
   (é o padrão). O log também avisa sozinho quando a resolução pedida é
   ignorada pelo driver.
+- **`detecção ... (pior NNN ms)` no STATS** — a média de `detecção` engana: o
+  reconhecimento caro roda de vez em quando, então a média se dilui e o que o
+  olho percebe é o **pior**. `pior` na casa de 70-250 ms é o ArcFace gerando o
+  embedding; se aparecer a cada poucos segundos com a cena parada, algo está
+  impedindo o app de reaproveitar o resultado anterior.
+- **Pessoa errada no carimbo** — o app precisa de **duas ou mais** pessoas
+  cadastradas para ter margem de decisão. Com uma só, qualquer rosto que chegue
+  perto o bastante é aceito (não existe "rival" para comparar). Cadastre todos
+  os operadores. O log traz `[Rank]`/`[Multi]` com o cosseno de cada caixa.
 - **Foto não sai ao apertar o botão** — confira se a captura não está **Pausada**
   (LED permanece vermelho e o botão fica desabilitado) ou se ainda não passou o
   tempo mínimo entre fotos.
@@ -143,5 +183,6 @@ gente errada, apague com **Redefinir galeria**.
 - O sistema mantém a câmera aberta — não deixe o PC suspender
   (energia > suspensão desativada) se precisar de operação contínua.
 - O app é instância única: rodar duas vezes apenas mostra a janela existente.
-- A janela abre **visível** para os operadores. Fechando a janela, o app
-  continua na bandeja; para sair de verdade use o menu da bandeja → **Sair**.
+- A janela abre **visível** para os operadores. Clicar no **X** encerra o
+  programa; **minimizar** manda para a bandeja, onde a captura continua (menu da
+  bandeja → **Sair** também encerra).

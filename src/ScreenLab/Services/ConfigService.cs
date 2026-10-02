@@ -79,7 +79,11 @@ public class AppConfig
 public static class ConfigService
 {
     public const string AppName = "ScreenLab";
-    public const int CurrentFaceEmbeddingVersion = 2;
+    // v3 =recognimento ArcFace (512-d). As galerias v2 foram gravadas com SFace
+    // (128-d) e não são comparáveis com embeddings de outra dimensão — mantê-las
+    // faria o app casar todo mundo com todo mundo. Descartar é o comportamento
+    // seguro: o usuário recadastra as poses.
+    public const int CurrentFaceEmbeddingVersion = 3;
 
     private static readonly object Sync = new();
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -371,7 +375,10 @@ public static class ConfigService
 
     private static bool IsUsableEmbedding(float[]? embedding)
     {
-        if (embedding is not { Length: 128 })
+        // Aceita qualquer dimensão plausível: o app troca entre SFace (128-d) e
+        // ArcFace (512-d), e fixar 128 fazia toda pose ser descartada na troca
+        // de modelo. O tamanho exato é validado pelo FaceRecognizerService.
+        if (embedding is not { Length: > 0 and <= 4096 })
             return false;
 
         double sumSquares = 0;

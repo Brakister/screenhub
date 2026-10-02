@@ -5,6 +5,16 @@
 dotnet build src\ScreenLab\ScreenLab.csproj -c Release
 ```
 
+Num clone novo, antes do primeiro build:
+```powershell
+git lfs install
+git lfs pull
+```
+O modelo de reconhecimento (`src\ScreenLab\Data\models\arcfaceresnet100-8.onnx`,
+249 MB) é versionado no **Git LFS** (ver `.gitattributes`) — sem o `git lfs pull`
+ele baixa como um arquivo de 130 bytes e o build sai sem o reconhecimento
+facial, sem dar erro.
+
 ## Publicar o executável autônomo
 Gera **um `.exe` só** em `publish\` — é esse arquivo que vai para o GitHub
 Release e para o computador que vai rodar 24/7 (não precisa de .NET instalado).
@@ -35,14 +45,14 @@ A versão precisa estar incrementada em **dois** lugares — `ScreenLab.csproj`
 (`<Version>`) e `installer\ScreenLab.iss` (`MyAppVersion`):
 
 ```powershell
-git tag -a v1.4.0 -m "v1.4.0 - <resumo>"
+git tag -a v1.5.0 -m "v1.5.0 - <resumo>"
 git push origin main
-git push origin v1.4.0
+git push origin v1.5.0
 
-gh release create v1.4.0 `
+gh release create v1.5.0 `
   "publish\ScreenLab.exe#ScreenLab.exe" `
-  "publish\ScreenLab-Setup-1.4.0.exe#ScreenLab-Setup-1.4.0.exe" `
-  --title "ScreenLab v1.4.0" --notes-file notas.md --latest
+  "publish\ScreenLab-Setup-1.5.0.exe#ScreenLab-Setup-1.5.0.exe" `
+  --title "ScreenLab v1.5.0" --notes-file notas.md --latest
 ```
 
 ## Testar na máquina atual

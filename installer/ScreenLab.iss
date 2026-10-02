@@ -4,7 +4,7 @@
 ; arquivo. Instalacao por usuario (nao pede admin), destina a outro PC.
 
 #define MyAppName "ScreenLab"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.5.0"
 #define MyAppExeName "ScreenLab.exe"
 
 [Setup]

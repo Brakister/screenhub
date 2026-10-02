@@ -12,8 +12,12 @@ obj/
 # Logs locais
 *.log
 
-# Saida de build/publicacao (dotnet publish -o publish + instalador ISCC)
+# Saida de build/publicacao (dotnet publish -o publish + instalador ISCC).
+# O ScreenLab.exe sai com ~352 MB porque embute os modelos ONNX, e o setup
+# do Inno Setup sai com um pouco mais. Nada disso entra no git.
 publish/
+*.zip
+*.7z
 
 # Capturas temporarias do ambiente
 shot_current.png
@@ -21,3 +25,8 @@ shot_current.png
 # Lixo de investigacao: probes com uma copia de 61 MB do OpenCvSharpExtern.dll
 # e PNGs de debug. Ja esteve no remoto, mas nao deve voltar.
 tmp_probe/
+
+# Nao ignore src/ScreenLab/Data/models/*.onnx: o .exe do release embute o
+# ArcFace (249 MB), entao o build precisa do arquivo. Ele e versionado pelo
+# Git LFS (ver .gitattributes) -- colocá-lo aqui deixaria o modelo fora do
+# git e um clone novo nao compilaria.
